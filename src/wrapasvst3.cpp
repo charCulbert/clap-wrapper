@@ -270,7 +270,17 @@ tresult PLUGIN_API ClapAsVst3::canProcessSampleSize(int32 symbolicSampleSize)
 
 tresult PLUGIN_API ClapAsVst3::setState(IBStream *state)
 {
-  return (_plugin->load(CLAPVST3StreamAdapter(state)) ? Steinberg::kResultOk : Steinberg::kResultFalse);
+  if (!_plugin->load(CLAPVST3StreamAdapter(state)))
+  {
+    return Steinberg::kResultFalse;
+  }
+
+  // synchronize the VST3 parameter tree to the restored values, but silently:
+  // the host rescans the parameters itself after restoring a state, and no
+  // IComponentHandler callbacks may be issued while a state is being restored
+  updateParameterValues();
+
+  return Steinberg::kResultOk;
 }
 
 tresult PLUGIN_API ClapAsVst3::getState(IBStream *state)
@@ -1213,6 +1223,35 @@ void ClapAsVst3::param_rescan(clap_param_rescan_flags flags)
   if (vstflags == 0) return;
 
   // update parameter values in our own tree
+  updateParameterValues();
+
+  if (flags & CLAP_PARAM_RESCAN_INFO)
+  {
+    auto len = parameters.getParameterCount();
+    for (decltype(len) i = 0; i < len; ++i)
+    {
+      auto p = static_cast<Vst3Parameter *>(parameters.getParameterByIndex(i));
+      if (!p->isMidi)
+      {
+        // In this case, the name and module can also change.
+        // For now, don't rebuild the unit tree with modules but
+        // do rescan the name
+        clap_param_info_t info;
+        if (_plugin->_ext._params->get_info(_plugin->_plugin, p->param_index_for_clap_get_info, &info))
+        {
+          str8ToStr16(p->getInfo().title, info.name, str16BufferSize(p->getInfo().title));
+        }
+      }
+    }
+  }
+
+  this->componentHandler->restartComponent(vstflags);
+}
+
+void ClapAsVst3::updateParameterValues()
+{
+  if (!_plugin->_ext._params) return;
+
   auto len = parameters.getParameterCount();
   for (decltype(len) i = 0; i < len; ++i)
   {
@@ -1228,21 +1267,8 @@ void ClapAsVst3::param_rescan(clap_param_rescan_flags flags)
           p->setNormalized(newval);
         }
       }
-      if (flags & CLAP_PARAM_RESCAN_INFO)
-      {
-        // In this case, the name and module can also change.
-        // For now, don't rebuild the unit tree with modules but
-        // do rescan the name
-        clap_param_info_t info;
-        if (_plugin->_ext._params->get_info(_plugin->_plugin, p->param_index_for_clap_get_info, &info))
-        {
-          str8ToStr16(p->getInfo().title, info.name, str16BufferSize(p->getInfo().title));
-        }
-      }
     }
   }
-
-  this->componentHandler->restartComponent(vstflags);
 }
 
 void ClapAsVst3::param_clear(clap_id param, clap_param_clear_flags flags)
