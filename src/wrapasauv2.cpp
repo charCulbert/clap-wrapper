@@ -577,8 +577,8 @@ void WrapAsAUV2::SetBypassEffect(bool bypass)
     if (p != _parametertree.end())
     {
       const auto &info = p->second->info();
-      SetParameter(_bypassParamID, kAudioUnitScope_Global, 0,
-                   bypass ? info.max_value : info.min_value, 0);
+      SetParameter(_bypassParamID, kAudioUnitScope_Global, 0, bypass ? info.max_value : info.min_value,
+                   0);
     }
   }
 }
@@ -1200,8 +1200,7 @@ void WrapAsAUV2::onIdle()
           if (p != _parametertree.end())
           {
             const auto &info = p->second->info();
-            const bool bypassed =
-                (e._data._value.value >= 0.5 * (info.min_value + info.max_value));
+            const bool bypassed = (e._data._value.value >= 0.5 * (info.min_value + info.max_value));
             if (bypassed != _isBypassed)
             {
               _isBypassed = bypassed;
