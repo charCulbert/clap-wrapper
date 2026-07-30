@@ -23,6 +23,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <limits>
 #include <unordered_map>
 #include <dlfcn.h>
 
@@ -67,6 +68,13 @@ bool Clap::AUv3::inputNotePortsSupportMIDI2(const clap_plugin_t *plugin,
       return true;
   }
   return false;
+}
+
+NSTimeInterval Clap::AUv3::tailTimeForSamples(uint32_t samples, double sampleRate) noexcept
+{
+  if (samples >= static_cast<uint32_t>(std::numeric_limits<int32_t>::max()))
+    return std::numeric_limits<NSTimeInterval>::infinity();
+  return sampleRate > 0 ? static_cast<NSTimeInterval>(samples) / sampleRate : 0;
 }
 
 #if defined(CLAP_WRAPPER_HAS_CHARDIO_AUV3_METADATA)
@@ -419,12 +427,6 @@ class AUv3ImplDetail : public Clap::IHost, public Clap::IAutomation, public os::
       // run on the main thread, not the audio thread.
       self->fireTimers();
 
-      // Do NOT call params.flush() or on_main_thread() while processing.
-      // The render thread services pending parameter flushes outside process().
-      // JUCE's on_main_thread() acquires locks that process() also needs —
-      // calling both concurrently (main thread vs render thread) deadlocks.
-      if (processing->load()) return;
-
       if (self->_tailTimeChanged.exchange(false, std::memory_order_acquire))
       {
         __strong ClapAUv3AudioUnit *audioUnit = self->_audioUnit;
@@ -434,6 +436,12 @@ class AUv3ImplDetail : public Clap::IHost, public Clap::IAutomation, public os::
           [audioUnit didChangeValueForKey:@"tailTime"];
         }
       }
+
+      // Do NOT call params.flush() or on_main_thread() while processing.
+      // The render thread services pending parameter flushes outside process().
+      // JUCE's on_main_thread() acquires locks that process() also needs —
+      // calling both concurrently (main thread vs render thread) deadlocks.
+      if (processing->load()) return;
 
       self->serviceParameterFlushRequestOnMainThread();
 
@@ -1786,9 +1794,7 @@ static Clap::Library _library;
   if (_impl)
   {
     const auto samples = _impl->_cachedTailSamples.load(std::memory_order_acquire);
-    if (samples == UINT32_MAX) return INFINITY;
-    double sr = [self _busSampleRate];
-    if (sr > 0) return (double)samples / sr;
+    return Clap::AUv3::tailTimeForSamples(samples, [self _busSampleRate]);
   }
   return 0;
 }

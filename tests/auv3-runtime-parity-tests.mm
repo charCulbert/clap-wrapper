@@ -3,8 +3,10 @@
 #include "../src/detail/auv3/auv3_audiounit.h"
 
 #include <cassert>
+#include <cmath>
 #include <cstddef>
 #include <cstring>
+#include <limits>
 
 namespace
 {
@@ -175,6 +177,19 @@ void testMIDI2CapabilityDecision()
   state.supportsMIDI2 = true;
   assert(Clap::AUv3::inputNotePortsSupportMIDI2(&plugin, &notePorts));
 }
+
+void testTailTimeBoundaries()
+{
+  constexpr double sampleRate = 48000.0;
+  constexpr auto maximumFinite = static_cast<uint32_t>(std::numeric_limits<int32_t>::max() - 1);
+  assert(Clap::AUv3::tailTimeForSamples(0, sampleRate) == 0);
+  assert(Clap::AUv3::tailTimeForSamples(maximumFinite, sampleRate) ==
+         static_cast<double>(maximumFinite) / sampleRate);
+  assert(std::isinf(Clap::AUv3::tailTimeForSamples(
+      static_cast<uint32_t>(std::numeric_limits<int32_t>::max()), sampleRate)));
+  assert(std::isinf(Clap::AUv3::tailTimeForSamples(
+      std::numeric_limits<uint32_t>::max(), sampleRate)));
+}
 }  // namespace
 
 int main()
@@ -183,4 +198,5 @@ int main()
   testAbsentAndTruncatedMetadata();
   testPreparationAndMPEPolicy();
   testMIDI2CapabilityDecision();
+  testTailTimeBoundaries();
 }

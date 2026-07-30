@@ -27,6 +27,7 @@ struct TestState
   uint32_t inputEventCount = 0;
   bool inputEventsSorted = true;
   uint32_t processCalls = 0;
+  clap_process_status processStatus = CLAP_PROCESS_CONTINUE;
   float observedInputSamples[8] = {};
   uint32_t firstEventTimes[8] = {};
   struct EventSnapshot
@@ -202,7 +203,7 @@ clap_process_status processPlugin(const clap_plugin_t *plugin, const clap_proces
             100.0f * (float)(bus + 1) + 10.0f * (float)ch + (float)frame;
 
   state.processActive = false;
-  return CLAP_PROCESS_CONTINUE;
+  return state.processStatus;
 }
 
 void CLAP_ABI flushPlugin(const clap_plugin_t *plugin, const clap_input_events_t *input,
@@ -411,6 +412,36 @@ bool testNullBufferFallback()
   return expect(status == noErr, "null-buffer render status") &&
          expect(left != nullptr && right != nullptr, "fallback supplies null host buffers") &&
          expect(left[4] == 104.0f && right[4] == 114.0f, "fallback output samples");
+}
+
+bool testProcessErrorSilencesOutput()
+{
+  constexpr uint32_t frames = 8;
+  uint32_t channels[] = {2};
+  TestState state;
+  state.processStatus = CLAP_PROCESS_ERROR;
+  auto plugin = makePlugin(state);
+  Clap::AUv3::ProcessAdapter adapter;
+  adapter.setupProcessing(0, nullptr, 1, channels, &plugin, nullptr, nullptr, frames,
+                          CLAP_NOTE_DIALECT_CLAP);
+
+  float left[frames] = {};
+  float right[frames] = {};
+  auto output = makeBufferList(2);
+  output->mBuffers[0] = {1, sizeof(left), left};
+  output->mBuffers[1] = {1, sizeof(right), right};
+  state.expectedOutputPointers = {left, right};
+  AudioUnitRenderActionFlags flags = 0;
+  auto time = timestamp(12, 4);
+  const auto status = adapter.process(&flags, &time, frames, 0, output.get(), nullptr, nil);
+
+  bool silent = true;
+  for (uint32_t frame = 0; frame < frames; ++frame)
+    silent &= left[frame] == 0.0f && right[frame] == 0.0f;
+  return expect(status != noErr, "CLAP process error reaches the AU host") &&
+         expect((flags & kAudioUnitRenderAction_OutputIsSilence) != 0,
+                "CLAP process error marks output silent") &&
+         expect(silent, "CLAP process error clears output");
 }
 
 bool testSingleBusSameTimestampIsFresh()
@@ -1212,6 +1243,7 @@ int main()
   ok &= testDirectAndInPlace();
   ok &= testSingleBusSameTimestampIsFresh();
   ok &= testNullBufferFallback();
+  ok &= testProcessErrorSilencesOutput();
   ok &= testMultiBusCaching();
   ok &= testInterleavedFallback();
   ok &= testCapacityBoundaries();

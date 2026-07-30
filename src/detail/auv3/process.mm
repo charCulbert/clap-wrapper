@@ -192,6 +192,7 @@ void ProcessAdapter::setupProcessing(uint32_t numInputBusses, const uint32_t *in
   _interleavedOutputStorage.resize((size_t)maxOutputChannels * numMaxSamples, 0.0f);
   _directOutputPointers.assign(_outputStorageOffset[_numOutputs], nullptr);
   _lastRenderUsedDirectOutput = false;
+  _lastProcessStatus = CLAP_PROCESS_CONTINUE;
   _lastProcessedSampleTime = std::numeric_limits<double>::quiet_NaN();
 
   // Wire up CLAP process data
@@ -1039,7 +1040,22 @@ AUAudioUnitStatus ProcessAdapter::process(AudioUnitRenderActionFlags *actionFlag
   _lastRenderUsedDirectOutput = useDirectOutput;
 
   // Process once for all buses
-  _plugin->process(_plugin, &_processData);
+  _lastProcessStatus = _plugin->process(_plugin, &_processData);
+  if (_lastProcessStatus == CLAP_PROCESS_ERROR)
+  {
+    _outevents.clear();
+    if (useDirectOutput)
+    {
+      for (uint32_t ch = 0; ch < _output_ports[0].channel_count; ++ch)
+        std::fill_n(_output_ports[0].data32[ch], frameCount, 0.0f);
+    }
+    else
+    {
+      for (auto &channel : _outputStorage)
+        std::fill_n(channel.data(), frameCount, 0.0f);
+    }
+    goto copyOutput;
+  }
 
   // Process output events
   for (auto &evt : _outevents)
@@ -1203,6 +1219,11 @@ copyOutput:
     }
   }
 
+  if (_lastProcessStatus == CLAP_PROCESS_ERROR)
+  {
+    if (actionFlags) *actionFlags |= kAudioUnitRenderAction_OutputIsSilence;
+    return kAudioUnitErr_CannotDoInCurrentContext;
+  }
   return noErr;
 }
 

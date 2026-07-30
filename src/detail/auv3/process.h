@@ -292,6 +292,7 @@ class ProcessAdapter
   std::vector<float> _interleavedOutputStorage;
   std::vector<float *> _directOutputPointers;
   bool _lastRenderUsedDirectOutput = false;
+  clap_process_status _lastProcessStatus = CLAP_PROCESS_CONTINUE;
 };
 
 }  // namespace Clap::AUv3
