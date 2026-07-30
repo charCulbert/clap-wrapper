@@ -592,8 +592,7 @@ bool StandaloneHost::tryLoadStandaloneAndPluginSettings(const fs::path &fromDir,
   const auto restart = [this, restartAudio]
   {
     if (!restartAudio) return true;
-    rebuildMIDIEndpoints();
-    return startAudioThread();
+    return rebuildMIDIEndpoints() && startAudioThread();
   };
   if (!detail::isSettingsEnvelope(bytes))
   {

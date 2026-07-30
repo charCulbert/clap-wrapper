@@ -396,7 +396,7 @@ struct Plugin final : public Window
   bool loadSettings();
 
   void initializeMIDI();
-  void startMIDI();
+  [[nodiscard]] bool startMIDI();
 
   void initializeAudio(RtAudio::Api api = RtAudio::Api::WINDOWS_WASAPI);
   [[nodiscard]] bool startAudio();

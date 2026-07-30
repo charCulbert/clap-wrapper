@@ -1151,7 +1151,7 @@ Plugin::Plugin(std::shared_ptr<Clap::Plugin> clapPlugin, int nCmdShow)
     return true;
   };
 
-  startMIDI();
+  const auto midiStarted = startMIDI();
   refreshMIDIInputs();
 
   sah->displayAudioError = [this](auto &errorText)
@@ -1171,8 +1171,10 @@ Plugin::Plugin(std::shared_ptr<Clap::Plugin> clapPlugin, int nCmdShow)
 
   refreshLayout();
 
-  if (!startAudio())
+  if (midiStarted && !startAudio())
     LOGINFO("[ERROR] Initial standalone audio startup failed");
+  else if (!midiStarted)
+    LOGINFO("[ERROR] Initial standalone MIDI startup failed");
 
   // Honor the show state requested by the launcher (shortcut "Run:" / STARTUPINFO),
   // falling back to a normal window. SW_HIDE would otherwise leave us invisible-but-running.
@@ -1396,9 +1398,9 @@ void Plugin::initializeMIDI()
   }
 }
 
-void Plugin::startMIDI()
+bool Plugin::startMIDI()
 {
-  sah->startMIDIThread();
+  return sah->startMIDIThread();
 }
 
 void Plugin::initializeAudio(RtAudio::Api api)
