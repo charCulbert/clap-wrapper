@@ -626,7 +626,9 @@ bool StandaloneHost::tryLoadStandaloneAndPluginSettings(const fs::path &fromDir,
     restart();
     return false;
   }
-  if (loadPluginState(clapPlugin, envelope->pluginState)) return restart();
+  const auto loadedNewState = loadPluginState(clapPlugin, envelope->pluginState);
+  const auto restartedNewState = loadedNewState && restart();
+  if (restartedNewState) return true;
   services.restoreSettings(priorAudio, priorMidi);
   startupAudioSet = priorStartupSet;
   startAudioIn = priorStartupIn;
@@ -638,7 +640,9 @@ bool StandaloneHost::tryLoadStandaloneAndPluginSettings(const fs::path &fromDir,
   startAudioOutputUsed = priorStartupOutputUsed;
   currentBufferSize = priorBufferSize;
   if (havePriorPluginState) loadPluginState(clapPlugin, priorPluginState.bytes);
-  restart();
+  const auto restartedPriorState = restart();
+  if (!restartedPriorState)
+    LOGINFO("[ERROR] Settings load failed and prior audio configuration could not be restarted");
   return false;
 }
 

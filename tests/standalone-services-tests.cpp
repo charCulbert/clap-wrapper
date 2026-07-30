@@ -132,8 +132,9 @@ bool testBoundedSortedDelivery()
                     third->durationFrames == 31,
                 "delivery sorts by sample time then ingestion timestamp and preserves ramp duration") &&
          expect(boundedCount == bounded.size() && telemetry.consumed_events == 12 &&
+                    telemetry.accepted_events - telemetry.consumed_events == 247 &&
                     telemetry.rejected_events >= 1,
-                "continuous producers cannot extend a callback and out-of-block events are rejected");
+                "continuous producers cannot extend a callback, leave surplus queued, and reject stale events");
 }
 
 bool testEnvelopeAndRollback()
@@ -249,12 +250,39 @@ bool testThreadAndLifecycleGating()
          expect(routesCleared && selectionUpdated, "disabled routes and MIDI selection are reflected in snapshots") &&
          expect(activeRejected, "device and MIDI lifecycle changes are gated while audio runs");
 }
+
+bool testMidiEndpointBindingSeam()
+{
+  StandaloneServicesCore services;
+  services.setMidiPorts({midiPort(1), midiPort(2)});
+  services.setMidiPortOpen(2, false);
+  const bool failedOpen = services.setBoundMidiPortIds({1});
+  uint64_t selected[2]{};
+  clap_wrapper_standalone_midi_port_t ports[2]{};
+  clap_wrapper_standalone_midi_snapshot_t snapshot{};
+  snapshot.struct_size = sizeof(snapshot);
+  snapshot.ports = ports;
+  snapshot.port_capacity = 2;
+  snapshot.selected_port_ids = selected;
+  snapshot.selected_port_capacity = 2;
+  const bool failureVisible = failedOpen && services.getMidiSnapshot(snapshot) &&
+                              snapshot.selected_port_count == 1 && selected[0] == 1;
+  services.setMidiPortOpen(2, true);
+  const bool successVisible = services.setBoundMidiPortIds({1, 2}) && services.getMidiSnapshot(snapshot) &&
+                              snapshot.selected_port_count == 2;
+  services.setMidiPortOpen(1, false);
+  const bool closeVisible = services.setBoundMidiPortIds({2}) && services.getMidiSnapshot(snapshot) &&
+                            snapshot.selected_port_count == 1 && selected[0] == 2;
+  return expect(failureVisible && successVisible && closeVisible,
+                "endpoint binding seam keeps snapshots coherent across open failure, success and close");
+}
 } // namespace
 
 int main()
 {
   return testAbiAndNegotiation() && testIngressOrderCapacityAndRamp() && testBoundedSortedDelivery() &&
                  testEnvelopeAndRollback() && testConcurrentIngress() && testThreadAndLifecycleGating()
+                 && testMidiEndpointBindingSeam()
              ? 0
              : 1;
 }

@@ -238,9 +238,10 @@ struct StandaloneHost : Clap::IHost
   // Kept for the existing Windows UI; the standalone-services extension owns
   // selection for new integrations.
   std::vector<uint32_t> currentMidiPorts;
-  void startMIDIThread();
+  bool startMIDIThread();
   void stopMIDIThread();
   bool rebuildMIDIEndpoints();
+  std::function<bool(uint32_t)> testMidiPortOpen;
   void processMIDIEvents(double deltatime, std::vector<unsigned char> *message);
   static void midiCallback(double deltatime, std::vector<unsigned char> *message, void *userData);
 

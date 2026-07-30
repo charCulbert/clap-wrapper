@@ -58,6 +58,7 @@ function(target_add_standalone_wrapper)
 
     guarantee_rtaudio()
     guarantee_rtmidi()
+    find_package(Threads REQUIRED)
 
     set(salib ${SA_TARGET}-clap-wrapper-standalone-lib)
     add_library(${salib} STATIC
@@ -71,6 +72,7 @@ function(target_add_standalone_wrapper)
             clap-wrapper-shared-detail
             base-sdk-rtmidi
             base-sdk-rtaudio
+            Threads::Threads
             )
     target_link_libraries(${salib} PRIVATE clap-wrapper-compile-options)
 

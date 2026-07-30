@@ -14,11 +14,12 @@
 
 namespace freeaudio::clap_wrapper::standalone
 {
-void StandaloneHost::startMIDIThread()
+bool StandaloneHost::startMIDIThread()
 {
   stopMIDIThread();
   refreshMidiServiceSnapshot();
   std::vector<uint64_t> boundPorts;
+  bool allOpened{true};
   try
   {
     LOGINFO("Initializing Midi");
@@ -28,7 +29,7 @@ void StandaloneHost::startMIDIThread()
   catch (RtMidiError &error)
   {
     error.printMessage();
-    exit(EXIT_FAILURE);
+    return false;
   }
 
   LOGDETAIL("MIDI: There are {} MIDI input sources available.", numMidiPorts);
@@ -40,6 +41,12 @@ void StandaloneHost::startMIDIThread()
     const bool openedByWindowsUi = !currentMidiPorts.empty() &&
                                    std::find(currentMidiPorts.begin(), currentMidiPorts.end(), i) != currentMidiPorts.end();
     if (!openedByServices && !openedByWindowsUi) continue;
+    if (testMidiPortOpen)
+    {
+      if (!testMidiPortOpen(i)) allOpened = false;
+      else boundPorts.push_back(portId);
+      continue;
+    }
     try
     {
       auto midiIn = std::make_unique<RtMidiIn>();
@@ -52,9 +59,11 @@ void StandaloneHost::startMIDIThread()
     catch (RtMidiError &error)
     {
       error.printMessage();
+      allOpened = false;
     }
   }
   services.setBoundMidiPortIds(std::move(boundPorts));
+  return allOpened;
 }
 
 void StandaloneHost::processMIDIEvents(double deltatime, std::vector<unsigned char> *message)
@@ -89,8 +98,7 @@ void StandaloneHost::stopMIDIThread()
 bool StandaloneHost::rebuildMIDIEndpoints()
 {
   stopMIDIThread();
-  startMIDIThread();
-  return true;
+  return startMIDIThread();
 }
 
 }  // namespace freeaudio::clap_wrapper::standalone
