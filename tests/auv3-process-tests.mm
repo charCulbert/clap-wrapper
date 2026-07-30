@@ -16,6 +16,12 @@ struct TestState
   bool inputWasInPlace = false;
   bool pushOutputEvents = false;
   bool outputPushResults[3] = {};
+  bool emitParameterFlushEvents = false;
+  bool flushCalledDuringProcess = false;
+  bool flushInputWasEmpty = true;
+  bool processActive = false;
+  uint32_t parameterFlushCalls = 0;
+  bool parameterFlushPushResults[3] = {};
   uint32_t inputEventCount = 0;
   bool inputEventsSorted = true;
   uint32_t processCalls = 0;
@@ -38,6 +44,25 @@ struct TestState
   uint32_t capturedEventCount = 0;
   const clap_wrapper_plugin_auv3_param_ramp_t *rampExtension = nullptr;
   const clap_plugin_t *translatorPluginSeen = nullptr;
+};
+
+struct TestAutomation final : Clap::IAutomation
+{
+  enum class Type { begin, value, end };
+  struct Event { Type type; clap_id id; double value; };
+  Event events[16] = {};
+  uint32_t count = 0;
+
+  void onBeginEdit(clap_id id) override { append({Type::begin, id, 0.0}); }
+  void onPerformEdit(const clap_event_param_value_t *value) override
+  { append({Type::value, value->param_id, value->value}); }
+  void onEndEdit(clap_id id) override { append({Type::end, id, 0.0}); }
+
+private:
+  void append(Event event)
+  {
+    if (count < std::size(events)) events[count++] = event;
+  }
 };
 
 struct TestRampEvent
@@ -91,6 +116,7 @@ const void *getPluginExtension(const clap_plugin_t *plugin, const char *id)
 clap_process_status processPlugin(const clap_plugin_t *plugin, const clap_process_t *process)
 {
   auto &state = *static_cast<TestState *>(plugin->plugin_data);
+  state.processActive = true;
   ++state.processCalls;
 
   state.outputPointersMatched =
@@ -173,8 +199,36 @@ clap_process_status processPlugin(const clap_plugin_t *plugin, const clap_proces
         process->audio_outputs[bus].data32[ch][frame] =
             100.0f * (float)(bus + 1) + 10.0f * (float)ch + (float)frame;
 
+  state.processActive = false;
   return CLAP_PROCESS_CONTINUE;
 }
+
+void CLAP_ABI flushPlugin(const clap_plugin_t *plugin, const clap_input_events_t *input,
+                          const clap_output_events_t *output)
+{
+  auto &state = *static_cast<TestState *>(plugin->plugin_data);
+  ++state.parameterFlushCalls;
+  state.flushCalledDuringProcess |= state.processActive;
+  if (!state.emitParameterFlushEvents) return;
+
+  state.flushInputWasEmpty &= input->size(input) == 0;
+  clap_event_param_gesture_t begin{};
+  begin.header = {sizeof(begin), 0, CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_PARAM_GESTURE_BEGIN, 0};
+  begin.param_id = 42;
+  clap_event_param_value_t value{};
+  value.header = {sizeof(value), 0, CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_PARAM_VALUE, 0};
+  value.param_id = 42;
+  value.value = 0.75;
+  value.port_index = value.channel = value.key = value.note_id = -1;
+  clap_event_param_gesture_t end{};
+  end.header = {sizeof(end), 0, CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_PARAM_GESTURE_END, 0};
+  end.param_id = 42;
+  state.parameterFlushPushResults[0] = output->try_push(output, &begin.header);
+  state.parameterFlushPushResults[1] = output->try_push(output, &value.header);
+  state.parameterFlushPushResults[2] = output->try_push(output, &end.header);
+}
+
+const clap_plugin_params_t testParams = {nullptr, nullptr, nullptr, nullptr, nullptr, flushPlugin};
 
 struct AudioBufferListDeleter
 {
@@ -952,6 +1006,124 @@ bool testMalformedMIDI2EventList()
          expect(adapter.overflowCounts().midi2Malformed == 4,
                 "truncated and malformed MIDI2 packets increment diagnostics");
 }
+
+bool testPluginRequestedParameterFlush()
+{
+  constexpr uint32_t frames = 8;
+  uint32_t channels[] = {1};
+  TestState state;
+  state.emitParameterFlushEvents = true;
+  TestAutomation automation;
+  auto plugin = makePlugin(state);
+  std::atomic_bool requestFlush{true};
+  Clap::AUv3::ProcessAdapter adapter;
+  adapter.setupProcessing(0, nullptr, 1, channels, &plugin, &testParams, &automation, frames,
+                          CLAP_NOTE_DIALECT_CLAP);
+  adapter.setParameterFlushRequestFlag(&requestFlush);
+  auto output = makeBufferList(1);
+  float samples[frames] = {};
+  output->mBuffers[0] = {1, sizeof(samples), samples};
+  AudioUnitRenderActionFlags flags = 0;
+  auto firstTime = timestamp(0, 100);
+  auto firstStatus = adapter.process(&flags, &firstTime, frames, 0, output.get(), nullptr, nil);
+
+  // Repeated requests coalesce only at the request flag. A later request gets
+  // its own complete begin/value/end sequence.
+  requestFlush.store(true);
+  requestFlush.store(true);
+  auto secondTime = timestamp(8, 101);
+  auto secondStatus = adapter.process(&flags, &secondTime, frames, 0, output.get(), nullptr, nil);
+
+  return expect(firstStatus == noErr && secondStatus == noErr, "requested flush render status") &&
+         expect(state.parameterFlushCalls == 2, "repeated flush requests are serviced once per cycle") &&
+         expect(!state.flushCalledDuringProcess && state.flushInputWasEmpty,
+                "requested flush uses an empty input outside process") &&
+         expect(state.parameterFlushPushResults[0] && state.parameterFlushPushResults[1] &&
+                    state.parameterFlushPushResults[2], "requested flush output events are accepted") &&
+         expect(automation.count == 6, "flush output events reach AU automation") &&
+         expect(automation.events[0].type == TestAutomation::Type::begin &&
+                    automation.events[1].type == TestAutomation::Type::value &&
+                    automation.events[1].id == 42 && automation.events[1].value == 0.75 &&
+                    automation.events[2].type == TestAutomation::Type::end,
+                "flush begin/value/end ordering is preserved") &&
+         expect(automation.events[3].type == TestAutomation::Type::begin &&
+                    automation.events[4].type == TestAutomation::Type::value &&
+                    automation.events[5].type == TestAutomation::Type::end,
+                "later flush does not coalesce parameter events");
+}
+
+bool testInactivePluginRequestedParameterFlush()
+{
+  TestState state;
+  state.emitParameterFlushEvents = true;
+  TestAutomation automation;
+  auto plugin = makePlugin(state);
+  std::atomic_bool requestFlush{true};
+  clap_output_events_t output{};
+  output.ctx = &automation;
+  output.try_push = [](const clap_output_events_t *list, const clap_event_header_t *event) -> bool
+  {
+    auto *target = static_cast<TestAutomation *>(list->ctx);
+    switch (event->type)
+    {
+      case CLAP_EVENT_PARAM_GESTURE_BEGIN:
+        target->onBeginEdit(reinterpret_cast<const clap_event_param_gesture_t *>(event)->param_id);
+        return true;
+      case CLAP_EVENT_PARAM_VALUE:
+        target->onPerformEdit(reinterpret_cast<const clap_event_param_value_t *>(event));
+        return true;
+      case CLAP_EVENT_PARAM_GESTURE_END:
+        target->onEndEdit(reinterpret_cast<const clap_event_param_gesture_t *>(event)->param_id);
+        return true;
+      default:
+        return false;
+    }
+  };
+
+  const auto first = Clap::AUv3::serviceParameterFlushRequest(&plugin, &testParams, &requestFlush,
+                                                                &output);
+  const auto second = Clap::AUv3::serviceParameterFlushRequest(&plugin, &testParams, &requestFlush,
+                                                                 &output);
+  return expect(first && !second && state.parameterFlushCalls == 1,
+                "inactive request flush is serviced once") &&
+         expect(state.processCalls == 0 && !state.flushCalledDuringProcess,
+                "inactive request flush does not enter process") &&
+         expect(automation.count == 3 && automation.events[0].type == TestAutomation::Type::begin &&
+                    automation.events[1].type == TestAutomation::Type::value &&
+                    automation.events[2].type == TestAutomation::Type::end,
+                "inactive flush delivers begin/value/end to the update queue");
+}
+
+bool testPluginRequestedFlushOutputCapacity()
+{
+  constexpr uint32_t frames = 8;
+  uint32_t channels[] = {1};
+  TestState state;
+  state.emitParameterFlushEvents = true;
+  TestAutomation automation;
+  auto plugin = makePlugin(state);
+  std::atomic_bool requestFlush{true};
+  Clap::AUv3::ProcessAdapter adapter;
+  Clap::AUv3::ProcessAdapter::Capacities capacities;
+  capacities.outputEvents = 2;
+  adapter.setupProcessing(0, nullptr, 1, channels, &plugin, &testParams, &automation, frames,
+                          CLAP_NOTE_DIALECT_CLAP, capacities);
+  adapter.setParameterFlushRequestFlag(&requestFlush);
+  auto output = makeBufferList(1);
+  float samples[frames] = {};
+  output->mBuffers[0] = {1, sizeof(samples), samples};
+  AudioUnitRenderActionFlags flags = 0;
+  auto time = timestamp(0, 102);
+  adapter.process(&flags, &time, frames, 0, output.get(), nullptr, nil);
+
+  return expect(state.parameterFlushPushResults[0] && state.parameterFlushPushResults[1] &&
+                    !state.parameterFlushPushResults[2], "flush observes bounded output capacity") &&
+         expect(adapter.overflowCounts().outputEvents == 1,
+                "flush output capacity overflow is diagnostic") &&
+         expect(automation.count == 2 && automation.events[0].type == TestAutomation::Type::begin &&
+                    automation.events[1].type == TestAutomation::Type::value,
+                "admitted flush events retain ordering");
+}
 }  // namespace
 
 int main()
@@ -975,6 +1147,9 @@ int main()
   ok &= testMalformedParameterRampTranslation();
   ok &= testMIDI2EventLists();
   ok &= testMalformedMIDI2EventList();
+  ok &= testPluginRequestedParameterFlush();
+  ok &= testInactivePluginRequestedParameterFlush();
+  ok &= testPluginRequestedFlushOutputCapacity();
   if (ok) std::cout << "AUv3 process tests passed\n";
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

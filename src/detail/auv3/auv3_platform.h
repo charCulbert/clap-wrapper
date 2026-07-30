@@ -34,8 +34,6 @@ typedef UIView CLAPWRAP_ViewClass;
 typedef NSView CLAPWRAP_ViewClass;
 #endif
 
-// Private CLAP window-API identifier for UIKit. Kept in sync with the
-// constant of the same name in the hosted plugin's editor code.
-#ifndef CLAP_WINDOW_API_UIKIT
-#define CLAP_WINDOW_API_UIKIT "uikit"
-#endif
+// Private UIKit window API identifier. Keep this wrapper name distinct from
+// the CLAP SDK's identifier, which newer SDKs provide as a constant.
+static const char CLAPWRAP_WINDOW_API_UIKIT[] = "uikit";

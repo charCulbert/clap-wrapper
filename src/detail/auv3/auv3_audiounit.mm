@@ -137,6 +137,7 @@ class AUv3ImplDetail : public Clap::IHost, public Clap::IAutomation, public os::
   std::string _hostname = "CLAP-as-AUv3";
   std::atomic<bool> _initialized{false};
   std::atomic_bool _requestUICallback{false};
+  std::atomic_bool _parameterFlushRequested{false};
   dispatch_source_t _idleTimer = nullptr;
 
   // Back-reference to the ObjC audio unit (weak to avoid retain cycle)
@@ -167,8 +168,12 @@ class AUv3ImplDetail : public Clap::IHost, public Clap::IAutomation, public os::
   // thread, so we cache it to avoid calling into the plugin on the wrong thread.
   uint32_t _cachedLatencySamples = 0;
 
-  // Queue for audio -> UI thread parameter notifications
-  ClapWrapper::detail::shared::fixedqueue<queueEvent, 8192> _queueToUI;
+  // Queue for audio -> UI thread parameter notifications. Keep one slot empty:
+  // fixedqueue uses head == tail as its empty state.
+  static constexpr uint32_t kParameterOutputQueueSize = 8192;
+  ClapWrapper::detail::shared::fixedqueue<queueEvent, kParameterOutputQueueSize> _queueToUI;
+  std::atomic<uint32_t> _queueToUICount{0};
+  std::atomic<uint64_t> _parameterOutputEventOverflows{0};
 
   // CLAP timer extension support — mirrors VST3/AAX TimerObject pattern
   struct TimerObject
@@ -218,10 +223,13 @@ class AUv3ImplDetail : public Clap::IHost, public Clap::IAutomation, public os::
       // run on the main thread, not the audio thread.
       self->fireTimers();
 
-      // Do NOT call on_main_thread() while the plugin is processing.
+      // Do NOT call params.flush() or on_main_thread() while processing.
+      // The render thread services pending parameter flushes outside process().
       // JUCE's on_main_thread() acquires locks that process() also needs —
       // calling both concurrently (main thread vs render thread) deadlocks.
       if (processing->load()) return;
+
+      self->serviceParameterFlushRequestOnMainThread();
 
       // Service request_callback
       if (flag->exchange(false))
@@ -439,7 +447,9 @@ class AUv3ImplDetail : public Clap::IHost, public Clap::IAutomation, public os::
 
   void param_request_flush() override
   {
-    AUV3LOG("IHost::param_request_flush() called");
+    // The render path consumes this while active; the idle path does so on
+    // the main thread while inactive.
+    _parameterFlushRequested.store(true, std::memory_order_release);
   }
 
   void latency_changed() override
@@ -613,7 +623,7 @@ class AUv3ImplDetail : public Clap::IHost, public Clap::IAutomation, public os::
     queueEvent evt;
     evt._type = queueEvent::type::editstart;
     evt._data._id = id;
-    _queueToUI.push(evt);
+    enqueueParameterOutputEvent(evt);
   }
 
   void onPerformEdit(const clap_event_param_value_t *value) override
@@ -621,7 +631,7 @@ class AUv3ImplDetail : public Clap::IHost, public Clap::IAutomation, public os::
     queueEvent evt;
     evt._type = queueEvent::type::editvalue;
     evt._data._value = *value;
-    _queueToUI.push(evt);
+    enqueueParameterOutputEvent(evt);
   }
 
   void onEndEdit(clap_id id) override
@@ -629,7 +639,56 @@ class AUv3ImplDetail : public Clap::IHost, public Clap::IAutomation, public os::
     queueEvent evt;
     evt._type = queueEvent::type::editend;
     evt._data._id = id;
-    _queueToUI.push(evt);
+    enqueueParameterOutputEvent(evt);
+  }
+
+  bool enqueueParameterOutputEvent(const queueEvent &event)
+  {
+    // There is one producer at a time: render while active, main while inactive.
+    if (_queueToUICount.load(std::memory_order_acquire) >= kParameterOutputQueueSize - 1)
+    {
+      _parameterOutputEventOverflows.fetch_add(1, std::memory_order_relaxed);
+      return false;
+    }
+    _queueToUICount.fetch_add(1, std::memory_order_release);
+    _queueToUI.push(event);
+    return true;
+  }
+
+  void serviceParameterFlushRequestOnMainThread()
+  {
+    if (_initialized.load(std::memory_order_acquire) || !_plugin || !_plugin->_ext._params)
+      return;
+
+    clap_output_events_t output = {};
+    output.ctx = this;
+    output.try_push = [](const clap_output_events_t *list, const clap_event_header_t *event) -> bool
+    {
+      if (event == nullptr || event->space_id != CLAP_CORE_EVENT_SPACE_ID) return false;
+      auto *self = static_cast<AUv3ImplDetail *>(list->ctx);
+      switch (event->type)
+      {
+        case CLAP_EVENT_PARAM_VALUE:
+          if (event->size < sizeof(clap_event_param_value_t)) return false;
+          self->onPerformEdit(reinterpret_cast<const clap_event_param_value_t *>(event));
+          return true;
+        case CLAP_EVENT_PARAM_GESTURE_BEGIN:
+          if (event->size < sizeof(clap_event_param_gesture_t)) return false;
+          self->onBeginEdit(reinterpret_cast<const clap_event_param_gesture_t *>(event)->param_id);
+          return true;
+        case CLAP_EVENT_PARAM_GESTURE_END:
+          if (event->size < sizeof(clap_event_param_gesture_t)) return false;
+          self->onEndEdit(reinterpret_cast<const clap_event_param_gesture_t *>(event)->param_id);
+          return true;
+        default:
+          return true;
+      }
+    };
+
+    auto mainGuard = _plugin->AlwaysMainThread();
+    if (Clap::AUv3::serviceParameterFlushRequest(_plugin->_plugin, _plugin->_ext._params,
+                                                  &_parameterFlushRequested, &output))
+      drainParameterQueue();
   }
 
   // Drain the audio→UI parameter queue and forward automation events to the host.
@@ -639,6 +698,7 @@ class AUv3ImplDetail : public Clap::IHost, public Clap::IAutomation, public os::
     queueEvent evt;
     while (_queueToUI.pop(evt))
     {
+      _queueToUICount.fetch_sub(1, std::memory_order_acq_rel);
       if (!_parameterTree) continue;
 
       // The setValue calls below re-enter implementorValueObserver on this
@@ -700,6 +760,10 @@ class AUv3ImplDetail : public Clap::IHost, public Clap::IAutomation, public os::
 
       s_suppressParamObserverEcho = false;
     }
+
+    const auto dropped = _parameterOutputEventOverflows.exchange(0, std::memory_order_acq_rel);
+    if (dropped != 0)
+      AUV3ERR("Dropped %llu CLAP parameter output events: AU automation queue full", dropped);
   }
 
   // Deliver a single parameter value to the plugin via params->flush().
@@ -1486,6 +1550,7 @@ static Clap::Library _library;
       (uint32_t)outputChs.size(), outputChs.empty() ? nullptr : outputChs.data(),
       _impl->_plugin->_plugin, _impl->_plugin->_ext._params, _impl.get(), self.maximumFramesToRender,
       _impl->_midi_preferred_dialect);
+  _impl->_processAdapter->setParameterFlushRequestFlag(&_impl->_parameterFlushRequested);
 
   // Set transport state and musical context blocks
   _impl->_processAdapter->setTransportStateBlock(self.transportStateBlock);

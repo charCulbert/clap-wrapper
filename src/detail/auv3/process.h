@@ -32,6 +32,11 @@
 namespace Clap::AUv3
 {
 
+// Consume one coalesced host flush request using an empty input event list.
+// The caller supplies the appropriate output sink and thread context.
+bool serviceParameterFlushRequest(const clap_plugin_t *plugin, const clap_plugin_params_t *params,
+                                  std::atomic_bool *requestFlag, const clap_output_events_t *output);
+
 typedef union clap_multi_event
 {
   clap_event_header_t header;
@@ -136,6 +141,11 @@ class ProcessAdapter
   // cycles ran). Only legal when the render thread is quiesced.
   bool dequeueParameterChange(QueuedParamChange &out);
 
+  // request_flush() coalesces notifications in this wrapper-owned flag. The
+  // render thread consumes it and calls params.flush() before process().
+  // Output uses the normal bounded staging, so parameter events do not coalesce.
+  void setParameterFlushRequestFlag(std::atomic_bool *requestFlag);
+
   OverflowCounts overflowCounts() const;
   VectorCapacities vectorCapacities() const;
   uint64_t outputCopyCount() const;
@@ -151,6 +161,7 @@ class ProcessAdapter
                                      const clap_event_header_t *event);
 
   void sortEventIndices();
+  void serviceParameterFlushRequest();
   bool appendInputEvent(const clap_multi_event_t &event);
   bool enqueueOutputEvent(const clap_event_header_t *event);
   void translateAUv3Events(const AURenderEvent *head, AUEventSampleTime bufferStartTime,
@@ -175,6 +186,7 @@ class ProcessAdapter
  private:
   const clap_plugin_t *_plugin = nullptr;
   const clap_plugin_params_t *_ext_params = nullptr;
+  std::atomic_bool *_parameterFlushRequestFlag = nullptr;
   const clap_wrapper_plugin_auv3_param_ramp_t *_paramRampExtension = nullptr;
   clap_wrapper_auv3_param_ramp_translate_t _paramRampTranslator = nullptr;
   Clap::IAutomation *_automation = nullptr;

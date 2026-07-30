@@ -28,6 +28,21 @@ inline clap_sectime doubleToSecTime(double t)
   return std::round(t * CLAP_SECTIME_FACTOR);
 }
 
+bool serviceParameterFlushRequest(const clap_plugin_t *plugin, const clap_plugin_params_t *params,
+                                  std::atomic_bool *requestFlag, const clap_output_events_t *output)
+{
+  if (plugin == nullptr || params == nullptr || params->flush == nullptr || requestFlag == nullptr ||
+      output == nullptr || !requestFlag->exchange(false, std::memory_order_acq_rel))
+    return false;
+
+  clap_input_events_t emptyInput = {};
+  emptyInput.size = [](const clap_input_events_t *) -> uint32_t { return 0; };
+  emptyInput.get = [](const clap_input_events_t *, uint32_t) -> const clap_event_header_t *
+  { return nullptr; };
+  params->flush(plugin, &emptyInput, output);
+  return true;
+}
+
 ProcessAdapter::~ProcessAdapter()
 {
   if (_input_ports)
@@ -266,6 +281,11 @@ uint64_t ProcessAdapter::outputCopyCount() const
   return _outputCopyCount.load(std::memory_order_relaxed);
 }
 
+void ProcessAdapter::setParameterFlushRequestFlag(std::atomic_bool *requestFlag)
+{
+  _parameterFlushRequestFlag = requestFlag;
+}
+
 void ProcessAdapter::setTransportStateBlock(AUHostTransportStateBlock __nullable block)
 {
   _transportStateBlock = block;
@@ -285,6 +305,14 @@ void ProcessAdapter::sortEventIndices()
               auto t2 = _events[b].header.time;
               return (t1 == t2) ? (a < b) : (t1 < t2);
             });
+}
+
+void ProcessAdapter::serviceParameterFlushRequest()
+{
+  // Do not send process()'s input events a second time through flush().
+  // Output uses the existing preallocated _outevents staging.
+  Clap::AUv3::serviceParameterFlushRequest(_plugin, _ext_params, _parameterFlushRequestFlag,
+                                            &_out_events);
 }
 
 bool ProcessAdapter::appendInputEvent(const clap_multi_event_t &event)
@@ -825,6 +853,9 @@ AUAudioUnitStatus ProcessAdapter::process(AudioUnitRenderActionFlags *actionFlag
       addParameterEvent(qpc.id, qpc.value, 0);
     }
   }
+
+  // Service GUI-requested flushes before process(), never concurrently with it.
+  serviceParameterFlushRequest();
 
 #if 1
   // Translate AUv3 events to CLAP events
