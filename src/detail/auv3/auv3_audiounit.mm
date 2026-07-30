@@ -17,6 +17,8 @@
 #include <iostream>
 #include <memory>
 #include <atomic>
+#include <algorithm>
+#include <cstddef>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -31,6 +33,170 @@ static os_log_t _auv3Log()
 }
 #define AUV3LOG(...) os_log(_auv3Log(), __VA_ARGS__)
 #define AUV3ERR(...) os_log_error(_auv3Log(), __VA_ARGS__)
+
+static bool auv3NotePortsSupportMPE(const clap_plugin_t *plugin)
+{
+  if (!plugin || !plugin->get_extension) return false;
+  const auto *notePorts = static_cast<const clap_plugin_note_ports_t *>(
+      plugin->get_extension(plugin, CLAP_EXT_NOTE_PORTS));
+  if (!notePorts || !notePorts->count || !notePorts->get) return false;
+
+  const auto count = notePorts->count(plugin, true);
+  for (uint32_t index = 0; index < count; ++index)
+  {
+    clap_note_port_info_t info{};
+    if (notePorts->get(plugin, index, true, &info) &&
+        (info.supported_dialects & CLAP_NOTE_DIALECT_MIDI_MPE) != 0)
+      return true;
+  }
+  return false;
+}
+
+#if defined(CLAP_WRAPPER_HAS_CHARDIO_AUV3_METADATA)
+namespace
+{
+bool hasChardioMetadataField(uint32_t structSize, size_t fieldEnd)
+{
+  return structSize >= fieldEnd;
+}
+
+template <typename Type>
+constexpr size_t chardioFieldEnd(size_t offset)
+{
+  return offset + sizeof(Type);
+}
+}  // namespace
+
+namespace Clap::AUv3
+{
+ChardioRuntimeMetadata ChardioRuntimeMetadata::find(const clap_plugin_t *plugin)
+{
+  if (!plugin || !plugin->get_extension) return ChardioRuntimeMetadata(nullptr);
+
+  const auto *metadata = static_cast<const chardio_plugin_auv3_metadata_t *>(
+      plugin->get_extension(plugin, CHARDIO_PLUGIN_EXT_AUV3_METADATA));
+  if (!metadata ||
+      !hasChardioMetadataField(metadata->struct_size,
+                               chardioFieldEnd<uint32_t>(offsetof(chardio_plugin_auv3_metadata_t, version))) ||
+      metadata->version != CHARDIO_PLUGIN_AUV3_METADATA_VERSION)
+    return ChardioRuntimeMetadata(nullptr);
+
+  return ChardioRuntimeMetadata(metadata);
+}
+
+bool ChardioRuntimeMetadata::prepareForAUv3(const clap_plugin_t *plugin) const
+{
+  if (!_metadata ||
+      !hasChardioMetadataField(
+          _metadata->struct_size,
+          chardioFieldEnd<decltype(_metadata->prepare_for_auv3)>(
+              offsetof(chardio_plugin_auv3_metadata_t, prepare_for_auv3))) ||
+      !_metadata->prepare_for_auv3)
+    return true;
+
+  return _metadata->prepare_for_auv3(plugin);
+}
+
+std::vector<ChardioFactoryPreset> ChardioRuntimeMetadata::factoryPresets(
+    const clap_plugin_t *plugin) const
+{
+  std::vector<ChardioFactoryPreset> result;
+  if (!_metadata ||
+      !hasChardioMetadataField(
+          _metadata->struct_size,
+          chardioFieldEnd<decltype(_metadata->get_factory_preset_count)>(
+              offsetof(chardio_plugin_auv3_metadata_t, get_factory_preset_count))) ||
+      !hasChardioMetadataField(
+          _metadata->struct_size,
+          chardioFieldEnd<decltype(_metadata->get_factory_preset)>(
+              offsetof(chardio_plugin_auv3_metadata_t, get_factory_preset))) ||
+      !_metadata->get_factory_preset_count || !_metadata->get_factory_preset)
+    return result;
+
+  const auto count = _metadata->get_factory_preset_count(plugin);
+  result.reserve(count);
+  for (uint32_t index = 0; index < count; ++index)
+  {
+    chardio_auv3_factory_preset_t preset{};
+    preset.struct_size = sizeof(preset);
+    if (!_metadata->get_factory_preset(plugin, index, &preset, sizeof(preset)) ||
+        !hasChardioMetadataField(
+            preset.struct_size,
+            chardioFieldEnd<int32_t>(offsetof(chardio_auv3_factory_preset_t, number))) ||
+        !hasChardioMetadataField(
+            preset.struct_size,
+            chardioFieldEnd<const char *>(offsetof(chardio_auv3_factory_preset_t, name))) ||
+        !preset.name)
+      continue;
+
+    result.push_back({preset.number, preset.name});
+  }
+  return result;
+}
+
+bool ChardioRuntimeMetadata::loadFactoryPreset(const clap_plugin_t *plugin, int32_t number) const
+{
+  if (!_metadata ||
+      !hasChardioMetadataField(
+          _metadata->struct_size,
+          chardioFieldEnd<decltype(_metadata->load_factory_preset)>(
+              offsetof(chardio_plugin_auv3_metadata_t, load_factory_preset))) ||
+      !_metadata->load_factory_preset)
+    return false;
+
+  return _metadata->load_factory_preset(plugin, number);
+}
+
+bool ChardioRuntimeMetadata::getViewConfiguration(const clap_plugin_t *plugin,
+                                                   ChardioViewConfiguration &result) const
+{
+  if (!_metadata ||
+      !hasChardioMetadataField(
+          _metadata->struct_size,
+          chardioFieldEnd<decltype(_metadata->get_view_configuration)>(
+              offsetof(chardio_plugin_auv3_metadata_t, get_view_configuration))) ||
+      !_metadata->get_view_configuration)
+    return false;
+
+  chardio_auv3_view_configuration_t view{};
+  view.struct_size = sizeof(view);
+  if (!_metadata->get_view_configuration(plugin, &view, sizeof(view)) ||
+      !hasChardioMetadataField(
+          view.struct_size,
+          chardioFieldEnd<uint32_t>(offsetof(chardio_auv3_view_configuration_t, minimum_width))) ||
+      !hasChardioMetadataField(
+          view.struct_size,
+          chardioFieldEnd<uint32_t>(offsetof(chardio_auv3_view_configuration_t, minimum_height))) ||
+      !hasChardioMetadataField(
+          view.struct_size,
+          chardioFieldEnd<chardio_auv3_view_policy_t>(
+              offsetof(chardio_auv3_view_configuration_t, policy))) ||
+      (view.policy != CHARDIO_AUV3_VIEW_POLICY_HOST_DEFAULT &&
+       view.policy != CHARDIO_AUV3_VIEW_POLICY_FIXED &&
+       view.policy != CHARDIO_AUV3_VIEW_POLICY_RESIZABLE))
+    return false;
+
+  result = {view.minimum_width, view.minimum_height, view.policy};
+  return true;
+}
+
+bool ChardioRuntimeMetadata::supportsMPE(const clap_plugin_t *plugin) const
+{
+  chardio_auv3_mpe_policy_t policy = CHARDIO_AUV3_MPE_POLICY_FROM_NOTE_PORTS;
+  if (_metadata &&
+      hasChardioMetadataField(
+          _metadata->struct_size,
+          chardioFieldEnd<decltype(_metadata->get_mpe_policy)>(
+              offsetof(chardio_plugin_auv3_metadata_t, get_mpe_policy))) &&
+      _metadata->get_mpe_policy)
+  {
+    const auto explicitPolicy = _metadata->get_mpe_policy(plugin);
+    if (chardio_auv3_mpe_policy_is_valid(explicitPolicy)) policy = explicitPolicy;
+  }
+  return chardio_auv3_mpe_policy_supports_mpe(policy, plugin);
+}
+}  // namespace Clap::AUv3
+#endif
 
 // drainParameterQueue and the bypass setter reflect already-delivered values
 // into the AUParameter tree via setValue:originator:. The tree's
@@ -120,7 +286,15 @@ class AUv3ImplDetail : public Clap::IHost, public Clap::IAutomation, public os::
   // MIDI
   uint32_t _midi_preferred_dialect = CLAP_NOTE_DIALECT_CLAP;
   bool _midi_wants_midi_input = false;
+  bool _supportsMPE = false;
   std::vector<NSString *> _midiOutputNames;
+
+#if defined(CLAP_WRAPPER_HAS_CHARDIO_AUV3_METADATA)
+  Clap::AUv3::ChardioRuntimeMetadata _chardioRuntimeMetadata;
+  std::vector<Clap::AUv3::ChardioFactoryPreset> _factoryPresets;
+  Clap::AUv3::ChardioViewConfiguration _viewConfiguration;
+  bool _hasViewConfiguration = false;
+#endif
 
   // Parameters
   AUParameterTree *_parameterTree = nil;
@@ -169,6 +343,7 @@ class AUv3ImplDetail : public Clap::IHost, public Clap::IAutomation, public os::
   // latency_changed(). The AUv3 host reads the latency property from any
   // thread, so we cache it to avoid calling into the plugin on the wrong thread.
   uint32_t _cachedLatencySamples = 0;
+  std::atomic<uint32_t> _cachedTailSamples{0};
 
   // Queue for audio -> UI thread parameter notifications. Keep one slot empty:
   // fixedqueue uses head == tail as its empty state.
@@ -348,6 +523,28 @@ class AUv3ImplDetail : public Clap::IHost, public Clap::IAutomation, public os::
     }
   }
 
+  void refreshParameterCache()
+  {
+    if (!_plugin || !_plugin->_ext._params) return;
+
+    auto *params = _plugin->_ext._params;
+    auto *plugin = _plugin->_plugin;
+    std::unordered_map<clap_id, double> values;
+    const auto count = params->count(plugin);
+    for (uint32_t index = 0; index < count; ++index)
+    {
+      clap_param_info_t info;
+      if (!params->get_info(plugin, index, &info)) continue;
+
+      double value = info.default_value;
+      params->get_value(plugin, info.id, &value);
+      values[info.id] = value;
+    }
+
+    std::lock_guard<std::mutex> lock(_paramCacheMutex);
+    for (const auto &[id, value] : values) _paramValueCache[id] = value;
+  }
+
   void param_rescan(clap_param_rescan_flags flags) override
   {
     AUV3LOG("IHost::param_rescan(flags=0x%x) called", (unsigned)flags);
@@ -474,7 +671,18 @@ class AUv3ImplDetail : public Clap::IHost, public Clap::IAutomation, public os::
 
   void tail_changed() override
   {
-    AUV3LOG("IHost::tail_changed() called");
+    if (!_plugin || !_plugin->_ext._tail) return;
+
+    auto mainGuard = _plugin->AlwaysMainThread();
+    _cachedTailSamples.store(_plugin->_ext._tail->get(_plugin->_plugin), std::memory_order_release);
+
+    __weak ClapAUv3AudioUnit *weakAU = _audioUnit;
+    dispatch_async(dispatch_get_main_queue(), ^{
+      __strong ClapAUv3AudioUnit *audioUnit = weakAU;
+      if (!audioUnit) return;
+      [audioUnit willChangeValueForKey:@"tailTime"];
+      [audioUnit didChangeValueForKey:@"tailTime"];
+    });
   }
 
   bool gui_can_resize() override
@@ -869,6 +1077,7 @@ static Clap::Library _library;
   AUAudioUnitBusArray *_inputBusArray;
   AUAudioUnitBusArray *_outputBusArray;
   BOOL _renderResourcesAllocated;
+  AUAudioUnitPreset *_currentPreset;
 }
 
 - (instancetype)initWithComponentDescription:(AudioComponentDescription)componentDescription
@@ -1021,11 +1230,39 @@ static Clap::Library _library;
     AUV3LOG("init: calling plugin->initialize()");
     _impl->_plugin->initialize();
 
+#if defined(CLAP_WRAPPER_HAS_CHARDIO_AUV3_METADATA)
+    {
+      auto mainGuard = _impl->_plugin->AlwaysMainThread();
+      _impl->_chardioRuntimeMetadata =
+          Clap::AUv3::ChardioRuntimeMetadata::find(_impl->_plugin->_plugin);
+      if (!_impl->_chardioRuntimeMetadata.prepareForAUv3(_impl->_plugin->_plugin))
+      {
+        if (outError)
+          *outError = [NSError
+              errorWithDomain:@"ClapAUv3"
+                         code:-5
+                     userInfo:@{NSLocalizedDescriptionKey : @"CLAP plugin rejected AUv3 preparation"}];
+        return nil;
+      }
+      _impl->_factoryPresets = _impl->_chardioRuntimeMetadata.factoryPresets(_impl->_plugin->_plugin);
+      _impl->_hasViewConfiguration = _impl->_chardioRuntimeMetadata.getViewConfiguration(
+          _impl->_plugin->_plugin, _impl->_viewConfiguration);
+      _impl->_supportsMPE = _impl->_chardioRuntimeMetadata.supportsMPE(_impl->_plugin->_plugin);
+    }
+#else
+    _impl->_supportsMPE = auv3NotePortsSupportMPE(_impl->_plugin->_plugin);
+#endif
+
     // Cache the initial latency so the AUv3 host can read it from any thread.
     if (_impl->_plugin->_ext._latency)
     {
       _impl->_cachedLatencySamples = _impl->_plugin->_ext._latency->get(_impl->_plugin->_plugin);
       AUV3LOG("init: initial latency = %u samples", _impl->_cachedLatencySamples);
+    }
+    if (_impl->_plugin->_ext._tail)
+    {
+      _impl->_cachedTailSamples.store(_impl->_plugin->_ext._tail->get(_impl->_plugin->_plugin),
+                                      std::memory_order_release);
     }
 
     // Start the idle timer on the main queue. This services request_callback()
@@ -1324,6 +1561,180 @@ static Clap::Library _library;
   return @[];
 }
 
+- (MIDIProtocolID)AudioUnitMIDIProtocol
+{
+  return kMIDIProtocol_2_0;
+}
+
+- (BOOL)supportsMPE
+{
+  return _impl && _impl->_supportsMPE ? YES : NO;
+}
+
+- (BOOL)getViewPolicy:(uint32_t *)outPolicy
+          minimumWidth:(uint32_t *)outMinimumWidth
+         minimumHeight:(uint32_t *)outMinimumHeight
+{
+#if defined(CLAP_WRAPPER_HAS_CHARDIO_AUV3_METADATA)
+  if (!_impl || !_impl->_hasViewConfiguration) return NO;
+  if (outPolicy) *outPolicy = _impl->_viewConfiguration.policy;
+  if (outMinimumWidth) *outMinimumWidth = _impl->_viewConfiguration.minimumWidth;
+  if (outMinimumHeight) *outMinimumHeight = _impl->_viewConfiguration.minimumHeight;
+  return YES;
+#else
+  return NO;
+#endif
+}
+
+- (NSIndexSet *)supportedViewConfigurations:
+    (NSArray<AUAudioUnitViewConfiguration *> *)availableViewConfigurations
+{
+  uint32_t policy = 0, minimumWidth = 0, minimumHeight = 0;
+  if (![self getViewPolicy:&policy minimumWidth:&minimumWidth minimumHeight:&minimumHeight])
+    return [super supportedViewConfigurations:availableViewConfigurations];
+
+#if defined(CLAP_WRAPPER_HAS_CHARDIO_AUV3_METADATA)
+  if (policy == CHARDIO_AUV3_VIEW_POLICY_HOST_DEFAULT)
+    return [super supportedViewConfigurations:availableViewConfigurations];
+
+  NSMutableIndexSet *result = [NSMutableIndexSet indexSet];
+  [availableViewConfigurations
+      enumerateObjectsUsingBlock:^(AUAudioUnitViewConfiguration *configuration, NSUInteger index,
+                                   BOOL *) {
+        const bool matches = policy == CHARDIO_AUV3_VIEW_POLICY_FIXED
+                                 ? configuration.width == minimumWidth &&
+                                       configuration.height == minimumHeight
+                                 : configuration.width >= minimumWidth &&
+                                       configuration.height >= minimumHeight;
+        if (matches) [result addIndex:index];
+      }];
+  return result;
+#else
+  return [super supportedViewConfigurations:availableViewConfigurations];
+#endif
+}
+
+- (void)selectViewConfiguration:(AUAudioUnitViewConfiguration *)viewConfiguration
+{
+  uint32_t policy = 0, minimumWidth = 0, minimumHeight = 0;
+  if (![self getViewPolicy:&policy minimumWidth:&minimumWidth minimumHeight:&minimumHeight])
+  {
+    [super selectViewConfiguration:viewConfiguration];
+    return;
+  }
+
+#if defined(CLAP_WRAPPER_HAS_CHARDIO_AUV3_METADATA)
+  if (policy == CHARDIO_AUV3_VIEW_POLICY_FIXED &&
+      (viewConfiguration.width != minimumWidth || viewConfiguration.height != minimumHeight))
+    return;
+  if (policy == CHARDIO_AUV3_VIEW_POLICY_RESIZABLE &&
+      (viewConfiguration.width < minimumWidth || viewConfiguration.height < minimumHeight))
+    return;
+#endif
+}
+
+- (BOOL)_isInactiveForStateChange
+{
+  if (!_impl) return NO;
+  std::lock_guard<std::mutex> lock(_impl->_paramCacheMutex);
+  return !_renderResourcesAllocated;
+}
+
+- (NSArray<AUAudioUnitPreset *> *)factoryPresets
+{
+#if defined(CLAP_WRAPPER_HAS_CHARDIO_AUV3_METADATA)
+  if (!_impl) return @[];
+
+  NSMutableArray<AUAudioUnitPreset *> *result = [NSMutableArray new];
+  for (const auto &preset : _impl->_factoryPresets)
+  {
+    AUAudioUnitPreset *auPreset = [AUAudioUnitPreset new];
+    auPreset.number = preset.number;
+    auPreset.name = [NSString stringWithUTF8String:preset.name.c_str()];
+    if (auPreset.name) [result addObject:auPreset];
+  }
+  return result;
+#else
+  return @[];
+#endif
+}
+
+- (AUAudioUnitPreset *)currentPreset
+{
+  return _currentPreset;
+}
+
+- (void)setCurrentPreset:(AUAudioUnitPreset *)preset
+{
+  if (!preset || ![self _isInactiveForStateChange]) return;
+
+  if (preset.number >= 0)
+  {
+#if defined(CLAP_WRAPPER_HAS_CHARDIO_AUV3_METADATA)
+    if (!_impl || !_impl->_plugin) return;
+
+    const auto number = static_cast<int32_t>(preset.number);
+    const auto found = std::find_if(_impl->_factoryPresets.begin(), _impl->_factoryPresets.end(),
+                                    [number](const auto &candidate) { return candidate.number == number; });
+    if (found == _impl->_factoryPresets.end()) return;
+
+    auto mainGuard = _impl->_plugin->AlwaysMainThread();
+    if (!_impl->_chardioRuntimeMetadata.loadFactoryPreset(_impl->_plugin->_plugin, number)) return;
+    _impl->refreshParameterCache();
+    [self _notifyParameterValuesChanged];
+#else
+    return;
+#endif
+  }
+  else
+  {
+    NSError *error = nil;
+    NSDictionary<NSString *, id> *state = [super presetStateFor:preset error:&error];
+    if (!state) return;
+    [self setFullState:state];
+  }
+
+  [self willChangeValueForKey:@"currentPreset"];
+  _currentPreset = [preset copy];
+  [self didChangeValueForKey:@"currentPreset"];
+}
+
+- (NSArray<AUAudioUnitPreset *> *)userPresets
+{
+  return [super userPresets];
+}
+
+- (BOOL)supportsUserPresets
+{
+  return YES;
+}
+
+- (BOOL)saveUserPreset:(AUAudioUnitPreset *)userPreset error:(NSError **)outError
+{
+  if (![self _isInactiveForStateChange])
+  {
+    if (outError)
+      *outError = [NSError errorWithDomain:NSOSStatusErrorDomain
+                                      code:kAudioUnitErr_CannotDoInCurrentContext
+                                  userInfo:nil];
+    return NO;
+  }
+  return [super saveUserPreset:userPreset error:outError];
+}
+
+- (BOOL)deleteUserPreset:(AUAudioUnitPreset *)userPreset error:(NSError **)outError
+{
+  if (![self _isInactiveForStateChange])
+  {
+    if (outError)
+      *outError = [NSError errorWithDomain:NSOSStatusErrorDomain
+                                      code:kAudioUnitErr_CannotDoInCurrentContext
+                                  userInfo:nil];
+    return NO;
+  }
+  return [super deleteUserPreset:userPreset error:outError];
+}
+
 // Sample rate for time-based properties. A CLAP with no audio output ports
 // (note effect → aumi) has an empty output bus array, and indexing it raises
 // NSRangeException — fall back to the input side, then to 0 ("unknown").
@@ -1348,9 +1759,9 @@ static Clap::Library _library;
 
 - (NSTimeInterval)tailTime
 {
-  if (_impl && _impl->_plugin && _impl->_plugin->_ext._tail)
+  if (_impl)
   {
-    uint32_t samples = _impl->_plugin->_ext._tail->get(_impl->_plugin->_plugin);
+    const auto samples = _impl->_cachedTailSamples.load(std::memory_order_acquire);
     if (samples == UINT32_MAX) return INFINITY;
     double sr = [self _busSampleRate];
     if (sr > 0) return (double)samples / sr;
@@ -1440,6 +1851,20 @@ static Clap::Library _library;
   NSMutableDictionary *state = [[super fullState] mutableCopy];
   if (!state) state = [NSMutableDictionary new];
 
+  if (_impl)
+  {
+    // Keep an AU-native fallback independent of the CLAP state extension.
+    // This remains useful for plugins without state and for a rejected state
+    // load, while values still retain their stable CLAP parameter IDs.
+    NSMutableDictionary<NSString *, NSNumber *> *parameterValues = [NSMutableDictionary new];
+    {
+      std::lock_guard<std::mutex> lock(_impl->_paramCacheMutex);
+      for (const auto &[id, value] : _impl->_paramValueCache)
+        parameterValues[[NSString stringWithFormat:@"%u", id]] = @(value);
+    }
+    state[@"clapParameterValues"] = parameterValues;
+  }
+
   if (_impl && _impl->_plugin && _impl->_plugin->_ext._state)
   {
     Clap::StateMemento chunk;
@@ -1464,6 +1889,7 @@ static Clap::Library _library;
   AUV3LOG("setFullState (restore): entered");
   [super setFullState:fullState];
 
+  bool restoredCLAPState = false;
   if (_impl && _impl->_plugin && _impl->_plugin->_ext._state)
   {
     NSData *clapState = fullState[@"clapState"];
@@ -1473,38 +1899,45 @@ static Clap::Library _library;
       Clap::StateMemento chunk;
       chunk.setData((const uint8_t *)[clapState bytes], [clapState length]);
       auto mainGuard = _impl->_plugin->AlwaysMainThread();
-      _impl->_plugin->_ext._state->load(_impl->_plugin->_plugin, chunk);
-
-      // Refresh the parameter cache after state restore — all values may have
-      // changed. Collect first so the lock is not held across get_value() calls.
-      if (_impl->_plugin->_ext._params)
-      {
-        auto *params = _impl->_plugin->_ext._params;
-        auto *plug = _impl->_plugin->_plugin;
-        std::vector<std::pair<clap_id, double>> values;
-        uint32_t numParams = params->count(plug);
-        values.reserve(numParams);
-        for (uint32_t i = 0; i < numParams; ++i)
-        {
-          clap_param_info_t info;
-          if (params->get_info(plug, i, &info))
-          {
-            double value = 0;
-            if (params->get_value(plug, info.id, &value)) values.emplace_back(info.id, value);
-          }
-        }
-        {
-          std::lock_guard<std::mutex> lock(_impl->_paramCacheMutex);
-          for (auto &v : values) _impl->_paramValueCache[v.first] = v.second;
-        }
-      }
-      AUV3LOG("setFullState (restore): completed");
+      restoredCLAPState = _impl->_plugin->_ext._state->load(_impl->_plugin->_plugin, chunk);
+      if (restoredCLAPState) _impl->refreshParameterCache();
     }
     else
     {
       AUV3LOG("setFullState (restore): no clapState key in dictionary");
     }
   }
+
+  if (!restoredCLAPState && _impl)
+  {
+    NSDictionary<NSString *, NSNumber *> *parameterValues = fullState[@"clapParameterValues"];
+    if ([parameterValues isKindOfClass:[NSDictionary class]])
+    {
+      for (NSString *key in parameterValues)
+      {
+        NSNumber *value = parameterValues[key];
+        const auto parameterId = static_cast<clap_id>(key.longLongValue);
+        if (![value isKindOfClass:[NSNumber class]]) continue;
+
+        AUParameter *parameter =
+            [_impl->_parameterTree parameterWithAddress:(AUParameterAddress)parameterId];
+        if (parameter)
+          [parameter setValue:value.floatValue originator:nil];
+      }
+    }
+  }
+
+  if (_impl) [self _notifyParameterValuesChanged];
+}
+
+- (NSDictionary<NSString *, id> *)fullStateForDocument
+{
+  return self.fullState;
+}
+
+- (void)setFullStateForDocument:(NSDictionary<NSString *, id> *)fullStateForDocument
+{
+  self.fullState = fullStateForDocument;
 }
 
 // --- Render resources ---

@@ -17,13 +17,68 @@
 #import <AudioToolbox/AudioToolbox.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreAudioKit/CoreAudioKit.h>
+#import <CoreAudioKit/AUViewController.h>
 #import <CoreMIDI/CoreMIDI.h>
 
 #import "auv3_platform.h"
 
+#include <clapwrapper/chardio-auv3-metadata.h>
+
+#include <string>
+#include <vector>
+
 #pragma clang diagnostic pop
 
 @class ClapAUv3AudioUnit;
+
+namespace Clap::AUv3
+{
+// Chardio's optional metadata table is deliberately consumed only by the
+// non-realtime AU lifecycle. The fallback declaration bundled with
+// clap-wrapper predates these fields, so an ordinary standalone wrapper build
+// continues to expose no Chardio-specific runtime policy.
+#if defined(CLAP_WRAPPER_HAS_CHARDIO_AUV3_METADATA)
+struct ChardioFactoryPreset
+{
+  int32_t number = 0;
+  std::string name;
+};
+
+struct ChardioViewConfiguration
+{
+  uint32_t minimumWidth = 0;
+  uint32_t minimumHeight = 0;
+  chardio_auv3_view_policy_t policy = CHARDIO_AUV3_VIEW_POLICY_HOST_DEFAULT;
+};
+
+class ChardioRuntimeMetadata
+{
+ public:
+  ChardioRuntimeMetadata() = default;
+  static ChardioRuntimeMetadata find(const clap_plugin_t *plugin);
+
+  bool prepareForAUv3(const clap_plugin_t *plugin) const;
+  std::vector<ChardioFactoryPreset> factoryPresets(const clap_plugin_t *plugin) const;
+  bool loadFactoryPreset(const clap_plugin_t *plugin, int32_t number) const;
+  bool getViewConfiguration(const clap_plugin_t *plugin, ChardioViewConfiguration &result) const;
+  bool supportsMPE(const clap_plugin_t *plugin) const;
+
+ private:
+  explicit ChardioRuntimeMetadata(const chardio_plugin_auv3_metadata_t *metadata) : _metadata(metadata) {}
+
+  const chardio_plugin_auv3_metadata_t *_metadata = nullptr;
+};
+#else
+class ChardioRuntimeMetadata
+{
+ public:
+  static ChardioRuntimeMetadata find(const clap_plugin_t *) { return {}; }
+  bool prepareForAUv3(const clap_plugin_t *) const { return true; }
+  bool loadFactoryPreset(const clap_plugin_t *, int32_t) const { return false; }
+  bool supportsMPE(const clap_plugin_t *) const { return false; }
+};
+#endif
+}  // namespace Clap::AUv3
 
 // The view controller is also the AUAudioUnitFactory.
 // Apple's AUv3 model requires the NSExtensionPrincipalClass to be the
@@ -71,5 +126,10 @@
 // Called by the view controller to establish the back-reference needed
 // for gui_request_resize to set preferredContentSize on the VC.
 - (void)setViewController:(ClapAUv3ViewController *)vc;
+
+// Retrieves cached Chardio view policy. No plug-in callback is made here.
+- (BOOL)getViewPolicy:(uint32_t *)outPolicy
+          minimumWidth:(uint32_t *)outMinimumWidth
+         minimumHeight:(uint32_t *)outMinimumHeight;
 
 @end

@@ -35,6 +35,15 @@ if (APPLE)
         auv3-parameter-metadata-tests.mm
         ../src/detail/auv3/auv3_parameters.mm
     )
+    add_executable(auv3-runtime-parity-tests
+        auv3-runtime-parity-tests.mm
+        ../src/detail/auv3/auv3_audiounit.mm
+        ../src/detail/auv3/auv3_parameters.mm
+        ../src/detail/auv3/process.mm
+        ../src/clap_proxy.cpp
+        ../src/detail/clap/fsutil.cpp
+        ../src/detail/os/macos.mm
+    )
     target_include_directories(auv3-process-tests PRIVATE
         ..
         ../src
@@ -47,10 +56,22 @@ if (APPLE)
         ../include
         ${CLAP_SDK_ROOT}/include
     )
+    target_include_directories(auv3-runtime-parity-tests PRIVATE
+        ../..
+        ..
+        ../src
+        ../include
+        ${CLAP_SDK_ROOT}/include
+    )
     target_compile_features(auv3-process-tests PRIVATE cxx_std_17)
     target_compile_features(auv3-parameter-metadata-tests PRIVATE cxx_std_17)
+    target_compile_features(auv3-runtime-parity-tests PRIVATE cxx_std_17)
+    target_compile_definitions(auv3-runtime-parity-tests PRIVATE
+        CLAP_WRAPPER_VERSION="${CLAP_WRAPPER_VERSION}"
+    )
     target_compile_options(auv3-process-tests PRIVATE -fblocks)
     target_compile_options(auv3-parameter-metadata-tests PRIVATE -fblocks)
+    target_compile_options(auv3-runtime-parity-tests PRIVATE -fblocks -fobjc-arc)
     target_link_libraries(auv3-process-tests PRIVATE
         "-framework AudioToolbox"
         "-framework AVFoundation"
@@ -60,8 +81,18 @@ if (APPLE)
         "-framework AudioToolbox"
         "-framework Foundation"
     )
+    target_link_libraries(auv3-runtime-parity-tests PRIVATE
+        clap
+        "-framework AudioToolbox"
+        "-framework AVFoundation"
+        "-framework CoreAudioKit"
+        "-framework CoreMIDI"
+        "-framework Foundation"
+        "-framework AppKit"
+    )
     add_test(NAME auv3-process COMMAND auv3-process-tests)
     add_test(NAME auv3-parameter-metadata COMMAND auv3-parameter-metadata-tests)
+    add_test(NAME auv3-runtime-parity COMMAND auv3-runtime-parity-tests)
 endif()
 
 add_test(
