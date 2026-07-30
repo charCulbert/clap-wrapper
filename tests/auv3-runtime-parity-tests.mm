@@ -16,6 +16,7 @@ struct TestState
   bool prepareResult = true;
   bool loadedPreset = false;
   int32_t loadedNumber = 0;
+  bool supportsMIDI2 = false;
   chardio_auv3_mpe_policy_t mpePolicy = CHARDIO_AUV3_MPE_POLICY_FROM_NOTE_PORTS;
 };
 
@@ -88,12 +89,14 @@ uint32_t CLAP_ABI notePortCount(const clap_plugin_t *, bool isInput)
   return isInput ? 2 : 0;
 }
 
-bool CLAP_ABI getNotePort(const clap_plugin_t *, uint32_t index, bool isInput,
+bool CLAP_ABI getNotePort(const clap_plugin_t *plugin, uint32_t index, bool isInput,
                           clap_note_port_info_t *info)
 {
   if (!isInput || index > 1 || !info) return false;
   *info = {};
+  const auto &state = *static_cast<const TestState *>(plugin->plugin_data);
   info->supported_dialects = index == 1 ? CLAP_NOTE_DIALECT_MIDI_MPE : CLAP_NOTE_DIALECT_MIDI;
+  if (state.supportsMIDI2 && index == 0) info->supported_dialects |= CLAP_NOTE_DIALECT_MIDI2;
   return true;
 }
 
@@ -163,6 +166,15 @@ void testPreparationAndMPEPolicy()
   state.mpePolicy = CHARDIO_AUV3_MPE_POLICY_ENABLED;
   assert(metadata.supportsMPE(&plugin));
 }
+
+void testMIDI2CapabilityDecision()
+{
+  TestState state;
+  auto plugin = makePlugin(state);
+  assert(!Clap::AUv3::inputNotePortsSupportMIDI2(&plugin, &notePorts));
+  state.supportsMIDI2 = true;
+  assert(Clap::AUv3::inputNotePortsSupportMIDI2(&plugin, &notePorts));
+}
 }  // namespace
 
 int main()
@@ -170,4 +182,5 @@ int main()
   testPresentMetadata();
   testAbsentAndTruncatedMetadata();
   testPreparationAndMPEPolicy();
+  testMIDI2CapabilityDecision();
 }

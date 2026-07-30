@@ -33,6 +33,9 @@
 
 namespace Clap::AUv3
 {
+bool inputNotePortsSupportMIDI2(const clap_plugin_t *plugin,
+                                const clap_plugin_note_ports_t *notePorts);
+
 // Chardio's optional metadata table is deliberately consumed only by the
 // non-realtime AU lifecycle. The fallback declaration bundled with
 // clap-wrapper predates these fields, so an ordinary standalone wrapper build

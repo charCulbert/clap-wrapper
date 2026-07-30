@@ -52,6 +52,21 @@ static bool auv3NotePortsSupportMPE(const clap_plugin_t *plugin)
   return false;
 }
 
+bool Clap::AUv3::inputNotePortsSupportMIDI2(const clap_plugin_t *plugin,
+                                             const clap_plugin_note_ports_t *notePorts)
+{
+  if (!plugin || !notePorts || !notePorts->count || !notePorts->get) return false;
+  const auto count = notePorts->count(plugin, true);
+  for (uint32_t index = 0; index < count; ++index)
+  {
+    clap_note_port_info_t info{};
+    if (notePorts->get(plugin, index, true, &info) &&
+        (info.supported_dialects & CLAP_NOTE_DIALECT_MIDI2) != 0)
+      return true;
+  }
+  return false;
+}
+
 #if defined(CLAP_WRAPPER_HAS_CHARDIO_AUV3_METADATA)
 namespace
 {
@@ -286,6 +301,7 @@ class AUv3ImplDetail : public Clap::IHost, public Clap::IAutomation, public os::
   // MIDI
   uint32_t _midi_preferred_dialect = CLAP_NOTE_DIALECT_CLAP;
   bool _midi_wants_midi_input = false;
+  bool _supportsMIDI2 = false;
   bool _supportsMPE = false;
   std::vector<NSString *> _midiOutputNames;
 
@@ -313,6 +329,7 @@ class AUv3ImplDetail : public Clap::IHost, public Clap::IAutomation, public os::
   std::atomic_bool _parameterFlushRequiresAudioThread{false};
   std::atomic_bool _requestUICallback{false};
   std::atomic_bool _parameterFlushRequested{false};
+  std::atomic_bool _tailTimeChanged{false};
   dispatch_source_t _idleTimer = nullptr;
 
   // Back-reference to the ObjC audio unit (weak to avoid retain cycle)
@@ -406,6 +423,16 @@ class AUv3ImplDetail : public Clap::IHost, public Clap::IAutomation, public os::
       // calling both concurrently (main thread vs render thread) deadlocks.
       if (processing->load()) return;
 
+      if (self->_tailTimeChanged.exchange(false, std::memory_order_acquire))
+      {
+        __strong ClapAUv3AudioUnit *audioUnit = self->_audioUnit;
+        if (audioUnit)
+        {
+          [audioUnit willChangeValueForKey:@"tailTime"];
+          [audioUnit didChangeValueForKey:@"tailTime"];
+        }
+      }
+
       self->serviceParameterFlushRequestOnMainThread();
 
       // Service request_callback
@@ -469,14 +496,17 @@ class AUv3ImplDetail : public Clap::IHost, public Clap::IAutomation, public os::
     auto numMIDIOut = noteports->count(plugin, false);
 
     _midi_wants_midi_input = (numMIDIIn > 0);
+    _supportsMIDI2 = false;
     if (numMIDIIn > 0)
     {
-      clap_note_port_info_t info;
-      if (noteports->get(plugin, 0, true, &info))
+      for (decltype(numMIDIIn) i = 0; i < numMIDIIn; ++i)
       {
-        _midi_preferred_dialect = info.preferred_dialect;
+        clap_note_port_info_t info{};
+        if (!noteports->get(plugin, i, true, &info)) continue;
+        if (i == 0) _midi_preferred_dialect = info.preferred_dialect;
       }
     }
+    _supportsMIDI2 = Clap::AUv3::inputNotePortsSupportMIDI2(plugin, noteports);
 
     _midiOutputNames.clear();
     for (decltype(numMIDIOut) i = 0; i < numMIDIOut; ++i)
@@ -673,16 +703,8 @@ class AUv3ImplDetail : public Clap::IHost, public Clap::IAutomation, public os::
   {
     if (!_plugin || !_plugin->_ext._tail) return;
 
-    auto mainGuard = _plugin->AlwaysMainThread();
     _cachedTailSamples.store(_plugin->_ext._tail->get(_plugin->_plugin), std::memory_order_release);
-
-    __weak ClapAUv3AudioUnit *weakAU = _audioUnit;
-    dispatch_async(dispatch_get_main_queue(), ^{
-      __strong ClapAUv3AudioUnit *audioUnit = weakAU;
-      if (!audioUnit) return;
-      [audioUnit willChangeValueForKey:@"tailTime"];
-      [audioUnit didChangeValueForKey:@"tailTime"];
-    });
+    _tailTimeChanged.store(true, std::memory_order_release);
   }
 
   bool gui_can_resize() override
@@ -1563,7 +1585,7 @@ static Clap::Library _library;
 
 - (MIDIProtocolID)AudioUnitMIDIProtocol
 {
-  return kMIDIProtocol_2_0;
+  return _impl && _impl->_supportsMIDI2 ? kMIDIProtocol_2_0 : kMIDIProtocol_1_0;
 }
 
 - (BOOL)supportsMPE
