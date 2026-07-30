@@ -10,6 +10,20 @@ target_compile_features(parameter-flush-lifecycle-tests PRIVATE cxx_std_17)
 target_link_libraries(parameter-flush-lifecycle-tests PRIVATE Threads::Threads)
 add_test(NAME parameter-flush-lifecycle COMMAND parameter-flush-lifecycle-tests)
 
+add_executable(standalone-services-tests
+    standalone-services-tests.cpp
+    ../src/detail/standalone/standalone_services_core.cpp
+    ../src/detail/standalone/standalone_settings.cpp
+)
+target_include_directories(standalone-services-tests PRIVATE
+    ../src
+    ../include
+    ${CLAP_SDK_ROOT}/include
+)
+target_compile_features(standalone-services-tests PRIVATE cxx_std_17)
+target_link_libraries(standalone-services-tests PRIVATE Threads::Threads)
+add_test(NAME standalone-services COMMAND standalone-services-tests)
+
 if (APPLE)
     add_subdirectory(clap-macos-embedded)
 

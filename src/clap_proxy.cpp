@@ -572,6 +572,11 @@ const void *Plugin::clapExtension(const clap_host *host, const char *extension)
   if (!strcmp(extension, CLAP_EXT_CONTEXT_MENU)) return &HostExt::context_menu;
   if (!strcmp(extension, CLAP_EXT_EVENT_REGISTRY)) return &HostExt::eventregistry;
 
+  if (auto *plugin = static_cast<Plugin *>(host->host_data))
+  {
+    if (const auto *hostExtension = plugin->_parentHost->getExtension(extension)) return hostExtension;
+  }
+
 #if LIN
   if (!strcmp(extension, CLAP_EXT_POSIX_FD_SUPPORT)) return &HostExt::hostposixfd;
 #endif

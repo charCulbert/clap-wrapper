@@ -93,8 +93,9 @@ bool StandaloneHost::startAudioThread()
     auto in = startAudioIn;
     auto out = startAudioOut;
     auto sr = startSampleRate;
-    return startAudioThreadOn(in, 2, in > 0 && numAudioInputs > 0, out, 2,
-                              out > 0 && numAudioOutputs > 0, sr);
+    return startAudioThreadOn(in, startAudioInputChannels, startAudioInputUsed && numAudioInputs > 0, out,
+                              startAudioOutputChannels,
+                              startAudioOutputUsed && numAudioOutputs > 0, sr);
   }
 
   auto [in, out, sr] = getDefaultAudioInOutSampleRate();
@@ -180,6 +181,8 @@ bool StandaloneHost::startAudioThreadOn(unsigned int inputDeviceID, uint32_t inp
   audioInputUsed = useInput;
   audioOutputDeviceID = outputDeviceID;
   audioOutputUsed = useOutput;
+  currentInputChannels = 0;
+  currentOutputChannels = 0;
 
   auto dids = rtaDac->getDeviceIds();
   auto dnms = rtaDac->getDeviceNames();
@@ -231,7 +234,7 @@ bool StandaloneHost::startAudioThreadOn(unsigned int inputDeviceID, uint32_t inp
   currentSampleRate = sampleRate;
 
   RtAudio::StreamOptions options;
-  options.flags = RTAUDIO_SCHEDULE_REALTIME;
+  options.flags = RTAUDIO_SCHEDULE_REALTIME | RTAUDIO_NONINTERLEAVED;
 
   /*
    * RTAudio doesn't tell you what the possible frame sizes are but instead
@@ -283,6 +286,18 @@ bool StandaloneHost::startAudioThreadOn(unsigned int inputDeviceID, uint32_t inp
     LOGDETAIL("RtAudio Input Stream Channels {}", iParams.nChannels);
   }
 
+  clap_wrapper_standalone_audio_settings_t currentSettings{};
+  currentSettings.struct_size = sizeof(currentSettings);
+  currentSettings.input_device_id = useInput ? inputDeviceID : 0;
+  currentSettings.output_device_id = useOutput ? outputDeviceID : 0;
+  currentSettings.input_channels = useInput ? currentInputChannels : 0;
+  currentSettings.output_channels = useOutput ? currentOutputChannels : 0;
+  currentSettings.sample_rate = static_cast<uint32_t>(sampleRate);
+  currentSettings.buffer_size = currentBufferSize;
+  if (useInput) currentSettings.flags |= CLAP_WRAPPER_STANDALONE_AUDIO_INPUT_ENABLED;
+  if (useOutput) currentSettings.flags |= CLAP_WRAPPER_STANDALONE_AUDIO_OUTPUT_ENABLED;
+  services.recordAudioSettings(currentSettings);
+
   if (!rtaDac->isStreamOpen())
   {
     LOGINFO("[ERROR] Stream failed to open :  {}", rtaDac->getErrorText());
@@ -302,6 +317,7 @@ bool StandaloneHost::startAudioThreadOn(unsigned int inputDeviceID, uint32_t inp
   }
 
   running.store(true, std::memory_order_release);
+  services.setAudioRunning(true);
   finishedRunning.store(false, std::memory_order_release);
   return true;
 }
@@ -310,6 +326,8 @@ void StandaloneHost::stopAudioThread()
 {
   LOGINFO("Shutting down audio");
   if (!rtaDac) return;
+
+  services.setAudioRunning(false);
 
   if (!rtaDac->isStreamRunning())
   {

@@ -27,7 +27,7 @@
 #include "clap_proxy.h"
 #include "detail/shared/fixedqueue.h"
 #include "detail/shared/parameter_flush.h"
-#include "detail/shared/spinlock.h"
+#include "detail/standalone/standalone_services_core.h"
 
 namespace freeaudio::clap_wrapper::standalone
 {
@@ -71,14 +71,15 @@ struct StandaloneHost : Clap::IHost
   static constexpr int maxEventsPerCycle{256};
   static constexpr int eventSize{1024};
   static constexpr int queueSize{eventSize * maxEventsPerCycle};
-  const unsigned char eventQueue[queueSize]{};
+  alignas(std::max_align_t) unsigned char eventQueue[queueSize]{};
+  std::array<detail::StandaloneServicesCore::IngressEvent, maxEventsPerCycle> ingressStaging{};
 
   int currInput{0};
   void clearInputEvents()
   {
     currInput = 0;
   }
-  bool pushInputEvent(clap_event_header_t *event)
+  bool pushInputEvent(const clap_event_header_t *event)
   {
     if (event->size > eventSize)
     {
@@ -125,6 +126,7 @@ struct StandaloneHost : Clap::IHost
   {
     TRACE;
   }
+  const void *getExtension(const char *extension) override;
 
   bool saveStandaloneAndPluginSettings(const fs::path &intoDir, const fs::path &withName);
   bool tryLoadStandaloneAndPluginSettings(const fs::path &fromDir, const fs::path &withName);
@@ -231,20 +233,14 @@ struct StandaloneHost : Clap::IHost
   }
 
   // Implementation in standalone_host_midi.cpp
-  struct midiChunk
-  {
-    char dat[3]{};
-    midiChunk()
-    {
-      memset(dat, 0, sizeof(dat));
-    }
-  };
-  ClapWrapper::detail::shared::fixedqueue<midiChunk, 4096> midiToAudioQueue;
   std::vector<std::unique_ptr<RtMidiIn>> midiIns;
   uint32_t numMidiPorts{0};
+  // Kept for the existing Windows UI; the standalone-services extension owns
+  // selection for new integrations.
   std::vector<uint32_t> currentMidiPorts;
   void startMIDIThread();
   void stopMIDIThread();
+  bool rebuildMIDIEndpoints();
   void processMIDIEvents(double deltatime, std::vector<unsigned char> *message);
   static void midiCallback(double deltatime, std::vector<unsigned char> *message, void *userData);
 
@@ -273,19 +269,32 @@ struct StandaloneHost : Clap::IHost
 
   bool startupAudioSet{false};
   unsigned int startAudioIn{0}, startAudioOut{0};
+  uint32_t startAudioInputChannels{0}, startAudioOutputChannels{0};
   int startSampleRate{0};
-  void setStartupAudio(unsigned int in, unsigned int out, int sr)
+  bool startAudioInputUsed{false}, startAudioOutputUsed{false};
+  void setStartupAudio(unsigned int in, uint32_t inputChannels, unsigned int out, uint32_t outputChannels,
+                       int sr, bool useInput, bool useOutput)
   {
     startupAudioSet = true;
     startAudioIn = in;
     startAudioOut = out;
+    startAudioInputChannels = inputChannels;
+    startAudioOutputChannels = outputChannels;
     startSampleRate = sr;
+    startAudioInputUsed = useInput;
+    startAudioOutputUsed = useOutput;
   }
 
   bool activatePlugin(int32_t sr, int32_t minBlock, int32_t maxBlock);
   void deactivatePlugin();
   std::atomic_bool isActive{false};
   ClapWrapper::detail::shared::ParameterFlushLifecycle parameterFlushLifecycle;
+
+  detail::StandaloneServicesCore services;
+  void refreshAudioServiceSnapshot();
+  void refreshMidiServiceSnapshot();
+  bool restoreServiceSettings(const clap_wrapper_standalone_audio_settings_t &audio,
+                              const std::vector<uint64_t> &midiPorts);
 
   std::vector<RtAudio::Api> getCompiledApi();
   std::vector<RtAudio::DeviceInfo> getInputAudioDevices();
@@ -296,7 +305,6 @@ struct StandaloneHost : Clap::IHost
   clap_input_events inputEvents{};
   clap_output_events outputEvents{};
 
-  ClapWrapper::detail::shared::SpinLock processLock;
   std::atomic<bool> running{true}, finishedRunning{false};
 
   // We need to have play buffers for the clap. For now lets assume
