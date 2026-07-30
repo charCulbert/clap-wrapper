@@ -18,7 +18,9 @@ stable, nonzero, and valid for that `Clap::Plugin` lifetime.
 that advertises ABI version 1 receives each `AURenderEventParameterRamp` as one
 plugin-defined event through its fixed, allocation-free translator. The input
 includes the CLAP id, original AU parameter address, cookie, target, sample
-offset, and unmodified duration. Plugins without this extension retain the
+offset, and unmodified duration. The translator also receives the owning
+`clap_plugin_t*`, allowing it to use per-instance state such as the event-space
+ID registered during initialization. Plugins without this extension retain the
 legacy `CLAP_EVENT_PARAM_VALUE` fallback; the AUv3 adapter exposes both
 fallback and translation-failure counters in `OverflowCounts`.
 

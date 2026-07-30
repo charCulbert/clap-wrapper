@@ -441,6 +441,12 @@ void ProcessAdapter::finalizeNoteIdsAndActiveNotes()
       event.note.note_id = lookupNoteId(event.note.port_index, event.note.channel, event.note.key);
       if (event.note.note_id >= 0) removeFromActiveNotes(&event.note);
     }
+    else if (event.header.type == CLAP_EVENT_NOTE_EXPRESSION && event.noteexpression.key >= 0)
+    {
+      event.noteexpression.note_id = lookupNoteId(event.noteexpression.port_index,
+                                                  event.noteexpression.channel,
+                                                  event.noteexpression.key);
+    }
 
     _eventindices[writeIndex++] = eventIndex;
   }
@@ -480,7 +486,8 @@ bool ProcessAdapter::appendParameterRamp(const AUParameterEvent &event, clap_id 
       cookie,
       event.rampDurationSampleFrames};
   uint32_t eventSize = 0;
-  if (!_paramRampTranslator(&info, customEvent.custom, sizeof(customEvent.custom), &eventSize))
+  if (!_paramRampTranslator(_plugin, &info, customEvent.custom, sizeof(customEvent.custom),
+                            &eventSize))
   {
     _parameterRampTranslationFailures.fetch_add(1, std::memory_order_relaxed);
     return false;
@@ -522,16 +529,20 @@ void ProcessAdapter::appendMIDI2Events(const AUMIDIEventList &event, uint32_t sa
       {
         case 0x0:
         case 0x1:
-        case 0x2: messageWords = 1; break;
-        case 0x3:
-        case 0x4: messageWords = 2; break;
-        case 0x5:
+        case 0x2:
         case 0x6:
-        case 0x7: messageWords = 4; break;
-        default:
-          _midi2Malformed.fetch_add(1, std::memory_order_relaxed);
-          ++wordIndex;
-          continue;
+        case 0x7: messageWords = 1; break;
+        case 0x3:
+        case 0x4:
+        case 0x8:
+        case 0x9:
+        case 0xA: messageWords = 2; break;
+        case 0xB:
+        case 0xC: messageWords = 3; break;
+        case 0x5:
+        case 0xD:
+        case 0xE:
+        case 0xF: messageWords = 4; break;
       }
 
       if (messageWords > packet->wordCount - wordIndex)
@@ -689,8 +700,7 @@ void ProcessAdapter::translateAUv3Events(const AURenderEvent *head, AUEventSampl
             n.noteexpression.port_index = 0;
             n.noteexpression.channel = channel;
             n.noteexpression.key = me.data[1] & 0x7F;
-            n.noteexpression.note_id = lookupNoteId(n.noteexpression.port_index,
-                                                    n.noteexpression.channel, n.noteexpression.key);
+            n.noteexpression.note_id = -1;
             n.noteexpression.value = (double)(me.data[2] & 0x7F) / 127.0;
 
             appendInputEvent(n);
@@ -1299,11 +1309,16 @@ bool ProcessAdapter::addToActiveNotes(const clap_event_note_t *note)
 
 void ProcessAdapter::removeFromActiveNotes(const clap_event_note_t *note)
 {
+  // AU MIDI 1 carries no note identity. lookupNoteId() chooses the oldest
+  // matching active record, so remove exactly that record to provide FIFO
+  // pairing for overlapping NOTE_ONs of the same key.
   for (auto &i : _activeNotes)
   {
-    if (i.used && i.port_index == note->port_index && i.channel == note->channel && i.key == note->key)
+    if (i.used && i.note_id == note->note_id && i.port_index == note->port_index &&
+        i.channel == note->channel && i.key == note->key)
     {
       i.used = false;
+      return;
     }
   }
 }

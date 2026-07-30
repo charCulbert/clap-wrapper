@@ -25,7 +25,7 @@ typedef struct clap_wrapper_auv3_param_ramp_info {
 // CLAP event to event_storage, set event_size to its exact byte size, and return
 // true. event_storage belongs to the wrapper and is valid only for this call.
 typedef bool(CLAP_ABI *clap_wrapper_auv3_param_ramp_translate_t)(
-    const clap_wrapper_auv3_param_ramp_info_t *info, void *event_storage,
+    const clap_plugin_t *plugin, const clap_wrapper_auv3_param_ramp_info_t *info, void *event_storage,
     uint32_t event_storage_capacity, uint32_t *event_size);
 
 typedef struct clap_wrapper_plugin_auv3_param_ramp {

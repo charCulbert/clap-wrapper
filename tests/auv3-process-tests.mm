@@ -33,9 +33,11 @@ struct TestState
     int32_t noteId = -1;
     int16_t noteKey = -1;
     int16_t noteChannel = -1;
+    int32_t expressionNoteId = -1;
   } inputEvents[32];
   uint32_t capturedEventCount = 0;
   const clap_wrapper_plugin_auv3_param_ramp_t *rampExtension = nullptr;
+  const clap_plugin_t *translatorPluginSeen = nullptr;
 };
 
 struct TestRampEvent
@@ -51,11 +53,14 @@ struct TestRampEvent
 
 static_assert(sizeof(TestRampEvent) == 64, "test ramp must exercise the full wrapper storage");
 
-bool CLAP_ABI translateRamp(const clap_wrapper_auv3_param_ramp_info_t *info, void *storage,
+bool CLAP_ABI translateRamp(const clap_plugin_t *plugin,
+                            const clap_wrapper_auv3_param_ramp_info_t *info, void *storage,
                             uint32_t storageCapacity, uint32_t *eventSize)
 {
-  if (info == nullptr || storage == nullptr || eventSize == nullptr || storageCapacity < sizeof(TestRampEvent))
+  if (plugin == nullptr || info == nullptr || storage == nullptr || eventSize == nullptr ||
+      storageCapacity < sizeof(TestRampEvent))
     return false;
+  static_cast<TestState *>(plugin->plugin_data)->translatorPluginSeen = plugin;
   auto *event = static_cast<TestRampEvent *>(storage);
   *event = {{sizeof(TestRampEvent), info->sample_offset, 21, 3, 0}, info->parameter_id,
             info->parameter_address, info->cookie, info->target_value, info->duration_sample_frames, 0};
@@ -63,7 +68,8 @@ bool CLAP_ABI translateRamp(const clap_wrapper_auv3_param_ramp_info_t *info, voi
   return true;
 }
 
-bool CLAP_ABI translateMalformedRamp(const clap_wrapper_auv3_param_ramp_info_t *, void *storage,
+bool CLAP_ABI translateMalformedRamp(const clap_plugin_t *,
+                                     const clap_wrapper_auv3_param_ramp_info_t *, void *storage,
                                      uint32_t storageCapacity, uint32_t *eventSize)
 {
   if (storage == nullptr || eventSize == nullptr || storageCapacity < sizeof(clap_event_header_t))
@@ -134,6 +140,11 @@ clap_process_status processPlugin(const clap_plugin_t *plugin, const clap_proces
         snapshot.noteId = note->note_id;
         snapshot.noteKey = note->key;
         snapshot.noteChannel = note->channel;
+      }
+      else if (event->type == CLAP_EVENT_NOTE_EXPRESSION)
+      {
+        const auto *expression = reinterpret_cast<const clap_event_note_expression_t *>(event);
+        snapshot.expressionNoteId = expression->note_id;
       }
       else if (event->space_id == 21 && event->type == 3 && event->size == sizeof(TestRampEvent))
       {
@@ -598,6 +609,84 @@ bool testActiveNoteAdmissionIsAtomic()
          expect(adapter.overflowCounts().activeNotes == 1, "active-note admission overflow counted");
 }
 
+bool testOverlappingSameKeyNotesPairFIFO()
+{
+  constexpr uint32_t frames = 8;
+  uint32_t channels[] = {1};
+  TestState state;
+  auto plugin = makePlugin(state);
+  Clap::AUv3::ProcessAdapter adapter;
+  adapter.setupProcessing(0, nullptr, 1, channels, &plugin, nullptr, nullptr, frames,
+                          CLAP_NOTE_DIALECT_CLAP);
+  std::vector<AURenderEvent> events(4);
+  for (size_t i = 0; i < events.size(); ++i)
+  {
+    events[i].MIDI.eventType = AURenderEventMIDI;
+    events[i].MIDI.eventSampleTime = 0;
+    events[i].MIDI.length = 3;
+    events[i].MIDI.next = i + 1 < events.size() ? &events[i + 1] : nullptr;
+    events[i].MIDI.data[0] = i < 2 ? 0x90 : 0x80;
+    events[i].MIDI.data[1] = 60;
+    events[i].MIDI.data[2] = i < 2 ? 100 : 0;
+  }
+  auto output = makeBufferList(1);
+  float samples[frames] = {};
+  output->mBuffers[0] = {1, sizeof(samples), samples};
+  AudioUnitRenderActionFlags flags = 0;
+  auto time = timestamp(0, 65);
+  adapter.process(&flags, &time, frames, 0, output.get(), &events.front(), nil);
+
+  return expect(state.capturedEventCount == 4, "overlapping same-key events are preserved") &&
+         expect(state.inputEvents[0].header.type == CLAP_EVENT_NOTE_ON &&
+                    state.inputEvents[0].noteId == 0 &&
+                    state.inputEvents[1].header.type == CLAP_EVENT_NOTE_ON &&
+                    state.inputEvents[1].noteId == 1,
+                "overlapping same-key NOTE_ONs receive distinct ids") &&
+         expect(state.inputEvents[2].header.type == CLAP_EVENT_NOTE_OFF &&
+                    state.inputEvents[2].noteId == 0 &&
+                    state.inputEvents[3].header.type == CLAP_EVENT_NOTE_OFF &&
+                    state.inputEvents[3].noteId == 1,
+                "overlapping same-key NOTE_OFFs pair FIFO");
+}
+
+bool testSameBlockPolyPressureBindsNoteId()
+{
+  constexpr uint32_t frames = 8;
+  uint32_t channels[] = {1};
+  TestState state;
+  auto plugin = makePlugin(state);
+  Clap::AUv3::ProcessAdapter adapter;
+  adapter.setupProcessing(0, nullptr, 1, channels, &plugin, nullptr, nullptr, frames,
+                          CLAP_NOTE_DIALECT_CLAP);
+  std::vector<AURenderEvent> events(2);
+  for (size_t i = 0; i < events.size(); ++i)
+  {
+    events[i].MIDI.eventType = AURenderEventMIDI;
+    events[i].MIDI.eventSampleTime = 0;
+    events[i].MIDI.length = 3;
+    events[i].MIDI.next = i + 1 < events.size() ? &events[i + 1] : nullptr;
+    events[i].MIDI.data[1] = 60;
+  }
+  events[0].MIDI.data[0] = 0x90;
+  events[0].MIDI.data[2] = 100;
+  events[1].MIDI.data[0] = 0xA0;
+  events[1].MIDI.data[2] = 64;
+  auto output = makeBufferList(1);
+  float samples[frames] = {};
+  output->mBuffers[0] = {1, sizeof(samples), samples};
+  AudioUnitRenderActionFlags flags = 0;
+  auto time = timestamp(0, 66);
+  adapter.process(&flags, &time, frames, 0, output.get(), &events.front(), nil);
+
+  return expect(state.capturedEventCount == 2, "same-block pressure events are preserved") &&
+         expect(state.inputEvents[0].header.type == CLAP_EVENT_NOTE_ON &&
+                    state.inputEvents[0].noteId == 0,
+                "same-block pressure note is admitted first") &&
+         expect(state.inputEvents[1].header.type == CLAP_EVENT_NOTE_EXPRESSION &&
+                    state.inputEvents[1].expressionNoteId == 0,
+                "same-block poly pressure binds admitted note id");
+}
+
 bool testEventRegistry()
 {
   Clap::EventRegistry registry;
@@ -651,6 +740,44 @@ bool testTranslatedParameterRamp()
          expect(overflows.parameterRampFallbacks == 0 &&
                     overflows.parameterRampTranslationFailures == 0,
                 "translated ramp avoids fallback and translator failures");
+}
+
+bool testRampTranslatorReceivesPluginInstance()
+{
+  constexpr uint32_t frames = 8;
+  uint32_t channels[] = {1};
+  const clap_wrapper_plugin_auv3_param_ramp_t extension = {
+      CLAP_WRAPPER_AUV3_PARAM_RAMP_ABI_VERSION, translateRamp};
+  TestState firstState;
+  TestState secondState;
+  firstState.rampExtension = &extension;
+  secondState.rampExtension = &extension;
+  auto firstPlugin = makePlugin(firstState);
+  auto secondPlugin = makePlugin(secondState);
+  Clap::AUv3::ProcessAdapter firstAdapter;
+  Clap::AUv3::ProcessAdapter secondAdapter;
+  firstAdapter.setupProcessing(0, nullptr, 1, channels, &firstPlugin, nullptr, nullptr, frames,
+                               CLAP_NOTE_DIALECT_CLAP);
+  secondAdapter.setupProcessing(0, nullptr, 1, channels, &secondPlugin, nullptr, nullptr, frames,
+                                CLAP_NOTE_DIALECT_CLAP);
+  firstAdapter._cookieCache.emplace(42, nullptr);
+  secondAdapter._cookieCache.emplace(42, nullptr);
+  auto event = makeParameterRamp(0, 42, 0.25f, 16);
+  auto output = makeBufferList(1);
+  float samples[frames] = {};
+  output->mBuffers[0] = {1, sizeof(samples), samples};
+  AudioUnitRenderActionFlags flags = 0;
+  auto firstTime = timestamp(0, 63);
+  auto secondTime = timestamp(0, 64);
+  firstAdapter.process(&flags, &firstTime, frames, 0, output.get(), &event, nil);
+  secondAdapter.process(&flags, &secondTime, frames, 0, output.get(), &event, nil);
+
+  return expect(firstState.translatorPluginSeen == &firstPlugin,
+                "first ramp translator receives first plugin instance") &&
+         expect(secondState.translatorPluginSeen == &secondPlugin,
+                "second ramp translator receives second plugin instance") &&
+         expect(firstState.translatorPluginSeen != secondState.translatorPluginSeen,
+                "ramp translator instances do not share context");
 }
 
 bool testParameterRampFallbackAndCapacity()
@@ -736,8 +863,17 @@ bool testMIDI2EventLists()
   Clap::AUv3::ProcessAdapter adapter;
   adapter.setupProcessing(0, nullptr, 1, channels, &plugin, nullptr, nullptr, frames,
                           CLAP_NOTE_DIALECT_CLAP);
-  auto storage = makeMIDI2Event(103, 9, {{0x20abcdef}, {0x40901234, 0x56789abc},
-                                         {0x50abcdef, 2, 3, 4}});
+  auto storage = makeMIDI2Event(103, 9, {{0x20abcdef},
+                                         {0x40901234, 0x56789abc},
+                                         {0x50abcdef, 2, 3, 4},
+                                         {0x60abcdef},
+                                         {0x70abcdef},
+                                         {0x80abcdef, 2},
+                                         {0xA0abcdef, 2},
+                                         {0xB0abcdef, 2, 3},
+                                         {0xC0abcdef, 2, 3},
+                                         {0xD0abcdef, 2, 3, 4},
+                                         {0xF0abcdef, 2, 3, 4}});
   auto output = makeBufferList(1);
   float samples[frames] = {};
   output->mBuffers[0] = {1, sizeof(samples), samples};
@@ -749,7 +885,7 @@ bool testMIDI2EventLists()
   const auto &one = state.inputEvents[0];
   const auto &two = state.inputEvents[1];
   const auto &four = state.inputEvents[2];
-  return expect(state.inputEventCount == 3, "MIDI2 list splits 32/64/128-bit UMPs") &&
+  return expect(state.inputEventCount == 11, "MIDI2 list splits all UMP word counts") &&
          expect(one.header.time == 3 && one.midi2Port == 9 && one.midi2Data[0] == 0x20abcdef &&
                     one.midi2Data[1] == 0 && one.midi2Data[2] == 0 && one.midi2Data[3] == 0,
                 "32-bit UMP keeps offset cable and zero fill") &&
@@ -758,7 +894,29 @@ bool testMIDI2EventLists()
                 "64-bit UMP keeps two words and zero fill") &&
          expect(four.midi2Data[0] == 0x50abcdef && four.midi2Data[1] == 2 &&
                     four.midi2Data[2] == 3 && four.midi2Data[3] == 4,
-                "128-bit UMP keeps all four words");
+                "128-bit UMP keeps all four words") &&
+         expect(state.inputEvents[3].midi2Data[0] == 0x60abcdef &&
+                    state.inputEvents[3].midi2Data[1] == 0 &&
+                    state.inputEvents[4].midi2Data[0] == 0x70abcdef &&
+                    state.inputEvents[4].midi2Data[1] == 0,
+                "types 6 and 7 are one-word UMPs") &&
+         expect(state.inputEvents[5].midi2Data[0] == 0x80abcdef &&
+                    state.inputEvents[5].midi2Data[1] == 2 &&
+                    state.inputEvents[6].midi2Data[0] == 0xA0abcdef &&
+                    state.inputEvents[6].midi2Data[1] == 2,
+                "types 8 and A are two-word UMPs") &&
+         expect(state.inputEvents[7].midi2Data[0] == 0xB0abcdef &&
+                    state.inputEvents[7].midi2Data[2] == 3 &&
+                    state.inputEvents[7].midi2Data[3] == 0 &&
+                    state.inputEvents[8].midi2Data[0] == 0xC0abcdef &&
+                    state.inputEvents[8].midi2Data[2] == 3 &&
+                    state.inputEvents[8].midi2Data[3] == 0,
+                "types B and C are three-word UMPs with zero fill") &&
+         expect(state.inputEvents[9].midi2Data[0] == 0xD0abcdef &&
+                    state.inputEvents[9].midi2Data[3] == 4 &&
+                    state.inputEvents[10].midi2Data[0] == 0xF0abcdef &&
+                    state.inputEvents[10].midi2Data[3] == 4,
+                "types D and F are four-word UMPs");
 }
 
 bool testMalformedMIDI2EventList()
@@ -770,17 +928,29 @@ bool testMalformedMIDI2EventList()
   Clap::AUv3::ProcessAdapter adapter;
   adapter.setupProcessing(0, nullptr, 1, channels, &plugin, nullptr, nullptr, frames,
                           CLAP_NOTE_DIALECT_CLAP);
-  auto storage = makeMIDI2Event(0, 0, {{0x40000000}});
   auto output = makeBufferList(1);
   float samples[frames] = {};
   output->mBuffers[0] = {1, sizeof(samples), samples};
-  auto time = timestamp(0, 10);
   AudioUnitRenderActionFlags flags = 0;
-  adapter.process(&flags, &time, frames, 0, output.get(),
-                  reinterpret_cast<const AURenderEvent *>(storage.data()), nil);
-  return expect(state.inputEventCount == 0, "truncated MIDI2 UMP is dropped") &&
-         expect(adapter.overflowCounts().midi2Malformed == 1,
-                "truncated MIDI2 UMP increments diagnostics");
+  auto render = [&](std::vector<uint8_t> &storage, uint64_t hostTime)
+  {
+    auto time = timestamp(0, hostTime);
+    adapter.process(&flags, &time, frames, 0, output.get(),
+                    reinterpret_cast<const AURenderEvent *>(storage.data()), nil);
+  };
+  auto truncatedTwo = makeMIDI2Event(0, 0, {{0x40000000}});
+  auto truncatedThree = makeMIDI2Event(0, 0, {{0xB0000000, 2}});
+  auto truncatedFour = makeMIDI2Event(0, 0, {{0xD0000000, 2, 3}});
+  auto malformedPacket = makeMIDI2Event(0, 0, {{}});
+  reinterpret_cast<AURenderEvent *>(malformedPacket.data())
+      ->MIDIEventsList.eventList.packet[0].wordCount = 65;
+  render(truncatedTwo, 10);
+  render(truncatedThree, 11);
+  render(truncatedFour, 12);
+  render(malformedPacket, 13);
+  return expect(state.inputEventCount == 0, "truncated MIDI2 UMPs are dropped") &&
+         expect(adapter.overflowCounts().midi2Malformed == 4,
+                "truncated and malformed MIDI2 packets increment diagnostics");
 }
 }  // namespace
 
@@ -796,8 +966,11 @@ int main()
   ok &= testEventIndexOverflow();
   ok &= testAcrossBlockHeldNoteRetrigger();
   ok &= testActiveNoteAdmissionIsAtomic();
+  ok &= testOverlappingSameKeyNotesPairFIFO();
+  ok &= testSameBlockPolyPressureBindsNoteId();
   ok &= testEventRegistry();
   ok &= testTranslatedParameterRamp();
+  ok &= testRampTranslatorReceivesPluginInstance();
   ok &= testParameterRampFallbackAndCapacity();
   ok &= testMalformedParameterRampTranslation();
   ok &= testMIDI2EventLists();
