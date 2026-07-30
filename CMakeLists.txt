@@ -135,5 +135,6 @@ include(cmake/wrapper_functions.cmake)
 include(cmake/top_level_default.cmake)
 
 if (${CLAP_WRAPPER_BUILD_TESTS})
+    enable_testing()
     add_subdirectory(tests)
 endif()

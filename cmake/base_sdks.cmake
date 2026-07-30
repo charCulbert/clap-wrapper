@@ -61,18 +61,18 @@ function(guarantee_clap)
         if (NOT TARGET base-sdk-clap)
             add_library(base-sdk-clap ALIAS clap)
         endif()
+        message(STATUS "clap-wrapper: Reusing existing clap target")
         return()
     endif()
 
-
-    if (NOT "${CLAP_SDK_ROOT}" STREQUAL "")
+    if (DEFINED CLAP_SDK_ROOT AND NOT "${CLAP_SDK_ROOT}" STREQUAL "")
         # Use the provided root
     elseif (${CLAP_WRAPPER_DOWNLOAD_DEPENDENCIES})
         guarantee_cpm()
         CPMAddPackage(
                 NAME "clap"
                 GITHUB_REPOSITORY "free-audio/clap"
-                GIT_TAG "1.2.6"
+                GIT_TAG "1.2.10"
                 EXCLUDE_FROM_ALL TRUE
                 DOWNLOAD_ONLY TRUE
                 SOURCE_DIR cpm/clap
@@ -84,11 +84,18 @@ function(guarantee_clap)
 
     cmake_path(CONVERT "${CLAP_SDK_ROOT}" TO_CMAKE_PATH_LIST CLAP_SDK_ROOT)
     if(NOT EXISTS "${CLAP_SDK_ROOT}/include/clap/clap.h")
-        message(FATAL_ERROR "There is no CLAP SDK at ${CLAP_SDK_ROOT}. Please set CLAP_SDK_ROOT appropriately ")
+        message(FATAL_ERROR
+                "CLAP_SDK_ROOT does not point to a valid CLAP SDK: '${CLAP_SDK_ROOT}'. "
+                "Expected '${CLAP_SDK_ROOT}/include/clap/clap.h'.")
     endif()
 
-    message(STATUS "clap-wrapper: Configuring clap sdk")
-    add_subdirectory(${CLAP_SDK_ROOT} base-sdk-clap EXCLUDE_FROM_ALL)
+    message(STATUS "clap-wrapper: Configuring clap sdk from ${CLAP_SDK_ROOT}")
+    add_subdirectory("${CLAP_SDK_ROOT}" base-sdk-clap EXCLUDE_FROM_ALL)
+    if (NOT TARGET clap)
+        message(FATAL_ERROR
+                "The CLAP SDK at '${CLAP_SDK_ROOT}' did not define the expected 'clap' target.")
+    endif()
+    add_library(base-sdk-clap ALIAS clap)
 endfunction(guarantee_clap)
 
 function(guarantee_vst3sdk)
