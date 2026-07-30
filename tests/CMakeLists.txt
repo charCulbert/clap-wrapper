@@ -10,6 +10,7 @@ if (APPLE)
     target_include_directories(auv3-process-tests PRIVATE
         ..
         ../src
+        ../include
         ${CLAP_SDK_ROOT}/include
     )
     target_compile_features(auv3-process-tests PRIVATE cxx_std_17)

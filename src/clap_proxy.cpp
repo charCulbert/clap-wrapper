@@ -151,6 +151,10 @@ static bool track_info_get(const clap_host_t *host, clap_track_info_t *info)
 
 const clap_host_track_info trackinfo = {track_info_get};
 
+const clap_host_event_registry_t eventregistry = {
+    [](const clap_host_t *host, const char *spaceName, uint16_t *spaceId) -> bool
+    { return self(host)->queryEventSpace(spaceName, spaceId); }};
+
 }  // namespace HostExt
 
 std::shared_ptr<Plugin> Plugin::createInstance(const clap_plugin_factory *factory, const std::string &id,
@@ -552,8 +556,9 @@ void Plugin::param_request_flush()
 
 // Query an extension.
 // [thread-safe]
-const void *Plugin::clapExtension(const clap_host * /*host*/, const char *extension)
+const void *Plugin::clapExtension(const clap_host *host, const char *extension)
 {
+  (void)host;
   // TODO: add 'audio-ports' host-side extension
   if (!strcmp(extension, CLAP_EXT_LOG)) return &HostExt::log;
   if (!strcmp(extension, CLAP_EXT_PARAMS)) return &HostExt::params;
@@ -565,12 +570,25 @@ const void *Plugin::clapExtension(const clap_host * /*host*/, const char *extens
   if (!strcmp(extension, CLAP_EXT_TAIL)) return &HostExt::tail;
   if (!strcmp(extension, CLAP_EXT_STATE)) return &HostExt::state;
   if (!strcmp(extension, CLAP_EXT_CONTEXT_MENU)) return &HostExt::context_menu;
+  if (!strcmp(extension, CLAP_EXT_EVENT_REGISTRY)) return &HostExt::eventregistry;
 
 #if LIN
   if (!strcmp(extension, CLAP_EXT_POSIX_FD_SUPPORT)) return &HostExt::hostposixfd;
 #endif
 
   return nullptr;
+}
+
+bool Plugin::queryEventSpace(const char *spaceName, uint16_t *spaceId)
+{
+  // The CLAP event registry API is main-thread-only. Rejecting calls from a
+  // render thread keeps the registry's vector allocation and lookup out of RT.
+  if (!is_main_thread())
+  {
+    if (spaceId != nullptr) *spaceId = UINT16_MAX;
+    return false;
+  }
+  return _eventRegistry.query(spaceName, spaceId);
 }
 
 // Request the host to schedule a call to plugin->on_main_thread(plugin) on the main thread.

@@ -82,6 +82,19 @@ void ProcessAdapter::setupProcessing(uint32_t numInputBusses, const uint32_t *in
   _automation = automation;
   _preferred_midi_dialect = preferredMIDIDialect;
   _capacities = capacities;
+  _paramRampExtension = nullptr;
+  _paramRampTranslator = nullptr;
+  if (plugin != nullptr && plugin->get_extension != nullptr)
+  {
+    auto extension = static_cast<const clap_wrapper_plugin_auv3_param_ramp_t *>(
+        plugin->get_extension(plugin, CLAP_WRAPPER_EXT_AUV3_PARAM_RAMP));
+    if (extension != nullptr && extension->abi_version == CLAP_WRAPPER_AUV3_PARAM_RAMP_ABI_VERSION &&
+        extension->translate != nullptr)
+    {
+      _paramRampExtension = extension;
+      _paramRampTranslator = extension->translate;
+    }
+  }
 
   // Setup silent buffers
   if (numMaxSamples > 0)
@@ -219,6 +232,11 @@ void ProcessAdapter::setupProcessing(uint32_t numInputBusses, const uint32_t *in
   _outputEventOverflows.store(0, std::memory_order_relaxed);
   _activeNoteOverflows.store(0, std::memory_order_relaxed);
   _reorderScratchOverflows.store(0, std::memory_order_relaxed);
+  _parameterRampFallbacks.store(0, std::memory_order_relaxed);
+  _parameterRampTranslationFailures.store(0, std::memory_order_relaxed);
+  _midi2Malformed.store(0, std::memory_order_relaxed);
+  _inputBufferFallbacks.store(0, std::memory_order_relaxed);
+  _outputBufferFailures.store(0, std::memory_order_relaxed);
   _outputCopyCount.store(0, std::memory_order_relaxed);
   _nextNoteId = 0;
 }
@@ -229,7 +247,12 @@ ProcessAdapter::OverflowCounts ProcessAdapter::overflowCounts() const
           _eventIndexOverflows.load(std::memory_order_relaxed),
           _outputEventOverflows.load(std::memory_order_relaxed),
           _activeNoteOverflows.load(std::memory_order_relaxed),
-          _reorderScratchOverflows.load(std::memory_order_relaxed)};
+          _reorderScratchOverflows.load(std::memory_order_relaxed),
+          _parameterRampFallbacks.load(std::memory_order_relaxed),
+          _parameterRampTranslationFailures.load(std::memory_order_relaxed),
+          _midi2Malformed.load(std::memory_order_relaxed),
+          _inputBufferFallbacks.load(std::memory_order_relaxed),
+          _outputBufferFailures.load(std::memory_order_relaxed)};
 }
 
 ProcessAdapter::VectorCapacities ProcessAdapter::vectorCapacities() const
@@ -311,13 +334,18 @@ void ProcessAdapter::reorderSameSampleOrphanOffs(AVAudioFrameCount frameCount)
   active.clear();
 
   size_t noteOnCount = 0;
+  size_t activeNoteCount = 0;
   for (auto index : _eventindices)
   {
     if (_events[index].header.type == CLAP_EVENT_NOTE_ON) ++noteOnCount;
   }
-  if (noteOnCount > _capacities.reorderScratch)
+  for (const auto &note : _activeNotes)
   {
-    _reorderScratchOverflows.fetch_add(noteOnCount - _capacities.reorderScratch,
+    if (note.used) ++activeNoteCount;
+  }
+  if (activeNoteCount + noteOnCount > _capacities.reorderScratch)
+  {
+    _reorderScratchOverflows.fetch_add(activeNoteCount + noteOnCount - _capacities.reorderScratch,
                                        std::memory_order_relaxed);
     return;
   }
@@ -327,6 +355,11 @@ void ProcessAdapter::reorderSameSampleOrphanOffs(AVAudioFrameCount frameCount)
     return ((uint32_t)(uint16_t)port << 16) | ((uint32_t)(uint16_t)channel << 8) |
            ((uint32_t)(uint16_t)(key & 0x7f));
   };
+
+  for (const auto &note : _activeNotes)
+  {
+    if (note.used) active.emplace_back(packKey(note.port_index, note.channel, note.key));
+  }
 
   for (size_t i = 0; i < _eventindices.size(); ++i)
   {
@@ -386,6 +419,144 @@ void ProcessAdapter::reorderSameSampleOrphanOffs(AVAudioFrameCount frameCount)
   }
 }
 
+void ProcessAdapter::finalizeNoteIdsAndActiveNotes()
+{
+  size_t writeIndex = 0;
+  for (size_t readIndex = 0; readIndex < _eventindices.size(); ++readIndex)
+  {
+    const auto eventIndex = _eventindices[readIndex];
+    auto &event = _events[eventIndex];
+    if (event.header.type == CLAP_EVENT_NOTE_ON)
+    {
+      event.note.note_id = synthesizeNoteId();
+      if (!addToActiveNotes(&event.note))
+      {
+        // Do not expose a synthesized ID when its later NOTE_OFF could not
+        // recover it. Dropping the note is safer than an untracked voice.
+        continue;
+      }
+    }
+    else if (event.header.type == CLAP_EVENT_NOTE_OFF)
+    {
+      event.note.note_id = lookupNoteId(event.note.port_index, event.note.channel, event.note.key);
+      if (event.note.note_id >= 0) removeFromActiveNotes(&event.note);
+    }
+
+    _eventindices[writeIndex++] = eventIndex;
+  }
+  _eventindices.resize(writeIndex);
+}
+
+bool ProcessAdapter::appendParameterRamp(const AUParameterEvent &event, clap_id parameterId,
+                                         void *cookie, uint32_t sampleOffset,
+                                         AVAudioFrameCount frameCount)
+{
+  if (_paramRampExtension == nullptr || _paramRampTranslator == nullptr)
+  {
+    _parameterRampFallbacks.fetch_add(1, std::memory_order_relaxed);
+    clap_multi_event_t valueEvent;
+    memset(&valueEvent, 0, sizeof(valueEvent));
+    valueEvent.header.size = sizeof(clap_event_param_value_t);
+    valueEvent.header.type = CLAP_EVENT_PARAM_VALUE;
+    valueEvent.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+    valueEvent.header.time = sampleOffset;
+    valueEvent.param.param_id = parameterId;
+    valueEvent.param.value = event.value;
+    valueEvent.param.port_index = -1;
+    valueEvent.param.key = -1;
+    valueEvent.param.channel = -1;
+    valueEvent.param.note_id = -1;
+    valueEvent.param.cookie = cookie;
+    return appendInputEvent(valueEvent);
+  }
+
+  clap_multi_event_t customEvent;
+  memset(&customEvent, 0, sizeof(customEvent));
+  const clap_wrapper_auv3_param_ramp_info_t info = {
+      sampleOffset,
+      parameterId,
+      event.parameterAddress,
+      event.value,
+      cookie,
+      event.rampDurationSampleFrames};
+  uint32_t eventSize = 0;
+  if (!_paramRampTranslator(&info, customEvent.custom, sizeof(customEvent.custom), &eventSize))
+  {
+    _parameterRampTranslationFailures.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+
+  const auto &header = customEvent.header;
+  if (eventSize < sizeof(clap_event_header_t) || eventSize > sizeof(customEvent.custom) ||
+      header.size != eventSize || header.time != sampleOffset ||
+      header.time >= frameCount || header.space_id == CLAP_CORE_EVENT_SPACE_ID)
+  {
+    _parameterRampTranslationFailures.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+
+  return appendInputEvent(customEvent);
+}
+
+void ProcessAdapter::appendMIDI2Events(const AUMIDIEventList &event, uint32_t sampleOffset)
+{
+  const auto &eventList = event.eventList;
+  auto *packet = &eventList.packet[0];
+  for (uint32_t packetIndex = 0; packetIndex < eventList.numPackets; ++packetIndex)
+  {
+    // CoreMIDI limits MIDIEventPacket::words to 64. This avoids using a
+    // corrupt word count for traversal or reading beyond a packet.
+    if (packet->wordCount > 64)
+    {
+      _midi2Malformed.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+
+    uint32_t wordIndex = 0;
+    while (wordIndex < packet->wordCount)
+    {
+      const uint32_t firstWord = packet->words[wordIndex];
+      const uint32_t messageType = firstWord >> 28;
+      uint32_t messageWords = 0;
+      switch (messageType)
+      {
+        case 0x0:
+        case 0x1:
+        case 0x2: messageWords = 1; break;
+        case 0x3:
+        case 0x4: messageWords = 2; break;
+        case 0x5:
+        case 0x6:
+        case 0x7: messageWords = 4; break;
+        default:
+          _midi2Malformed.fetch_add(1, std::memory_order_relaxed);
+          ++wordIndex;
+          continue;
+      }
+
+      if (messageWords > packet->wordCount - wordIndex)
+      {
+        _midi2Malformed.fetch_add(1, std::memory_order_relaxed);
+        break;
+      }
+
+      clap_multi_event_t midi2Event;
+      memset(&midi2Event, 0, sizeof(midi2Event));
+      midi2Event.header.size = sizeof(clap_event_midi2_t);
+      midi2Event.header.type = CLAP_EVENT_MIDI2;
+      midi2Event.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+      midi2Event.header.time = sampleOffset;
+      midi2Event.midi2.port_index = event.cable;
+      memcpy(midi2Event.midi2.data, &packet->words[wordIndex],
+             messageWords * sizeof(uint32_t));
+      appendInputEvent(midi2Event);
+      wordIndex += messageWords;
+    }
+
+    packet = MIDIEventPacketNext(packet);
+  }
+}
+
 void ProcessAdapter::translateAUv3Events(const AURenderEvent *head, AUEventSampleTime bufferStartTime,
                                          AVAudioFrameCount frameCount)
 {
@@ -425,9 +596,8 @@ void ProcessAdapter::translateAUv3Events(const AURenderEvent *head, AUEventSampl
     switch (event->head.eventType)
     {
       case AURenderEventParameter:
-      case AURenderEventParameterRamp:
       {
-        // AUv3 parameter events translate to CLAP_EVENT_PARAM_VALUE only.
+        // AUv3 point parameter events translate to CLAP_EVENT_PARAM_VALUE.
         // CLAP also has CLAP_EVENT_PARAM_MOD (per-event parameter modulation,
         // optionally polyphonic via note_id) — there is no AUv3 equivalent
         // and AU hosts never produce mod-shaped events. Plugins that declare
@@ -462,6 +632,16 @@ void ProcessAdapter::translateAUv3Events(const AURenderEvent *head, AUEventSampl
         break;
       }
 
+      case AURenderEventParameterRamp:
+      {
+        auto &pe = event->parameter;
+        clap_id pid = (clap_id)pe.parameterAddress;
+        auto cookieIt = _cookieCache.find(pid);
+        if (cookieIt == _cookieCache.end()) break;
+        appendParameterRamp(pe, pid, cookieIt->second, sampleOffset, frameCount);
+        break;
+      }
+
       case AURenderEventMIDI:
       {
         auto &me = event->MIDI;
@@ -481,12 +661,12 @@ void ProcessAdapter::translateAUv3Events(const AURenderEvent *head, AUEventSampl
             n.header.type = CLAP_EVENT_NOTE_ON;
             n.header.size = sizeof(clap_event_note_t);
             n.note.port_index = 0;
-            n.note.note_id = synthesizeNoteId();
+            n.note.note_id = -1;
             n.note.key = me.data[1] & 0x7F;
             n.note.velocity = (float)(me.data[2] & 0x7F) / 127.0f;
             n.note.channel = channel;
 
-            if (appendInputEvent(n)) addToActiveNotes(&n.note);
+            appendInputEvent(n);
             break;
           }
           else if (strippedStatus == 0x08 || (strippedStatus == 0x09 && me.data[2] == 0))  // Note Off
@@ -497,11 +677,8 @@ void ProcessAdapter::translateAUv3Events(const AURenderEvent *head, AUEventSampl
             n.note.key = me.data[1] & 0x7F;
             n.note.velocity = (strippedStatus == 0x08) ? (float)(me.data[2] & 0x7F) / 127.0f : 0.0f;
             n.note.channel = channel;
-            // Pair with the matching NOTE_ON's synthesized id (must run
-            // before removeFromActiveNotes drops the active record).
-            n.note.note_id = lookupNoteId(n.note.port_index, n.note.channel, n.note.key);
-
-            if (appendInputEvent(n)) removeFromActiveNotes(&n.note);
+            n.note.note_id = -1;
+            appendInputEvent(n);
             break;
           }
           else if (strippedStatus == 0x0A)  // Poly Aftertouch → per-note PRESSURE
@@ -581,8 +758,11 @@ void ProcessAdapter::translateAUv3Events(const AURenderEvent *head, AUEventSampl
         break;
       }
 
+      case AURenderEventMIDIEventList:
+        appendMIDI2Events(event->MIDIEventsList, sampleOffset);
+        break;
+
       default:
-        // AURenderEventMIDIEventList (MIDI 2.0) - not yet supported
         break;
     }
   }
@@ -594,6 +774,7 @@ AUAudioUnitStatus ProcessAdapter::process(AudioUnitRenderActionFlags *actionFlag
                                           const AURenderEvent *realtimeEventListHead,
                                           AURenderPullInputBlock __unsafe_unretained pullInputBlock)
 {
+  (void)actionFlags;
   bool useDirectOutput = false;
 
   // Never let the plugin write past the storage sized at allocate time —
@@ -609,13 +790,16 @@ AUAudioUnitStatus ProcessAdapter::process(AudioUnitRenderActionFlags *actionFlag
   // timestamp, so we run the full CLAP process on the first bus pulled in a
   // cycle (whichever it is), storing all output. The other buses of the same
   // cycle just copy from storage.
-  if (timestamp->mSampleTime == _lastProcessedSampleTime &&
+  if (_numOutputs > 1 && timestamp->mSampleTime == _lastProcessedSampleTime &&
       timestamp->mHostTime == _lastProcessedHostTime)
   {
     goto copyOutput;
   }
-  _lastProcessedSampleTime = timestamp->mSampleTime;
-  _lastProcessedHostTime = timestamp->mHostTime;
+  if (_numOutputs > 1)
+  {
+    _lastProcessedSampleTime = timestamp->mSampleTime;
+    _lastProcessedHostTime = timestamp->mHostTime;
+  }
 
   // Clear events from previous cycle
   _events.clear();
@@ -627,7 +811,7 @@ AUAudioUnitStatus ProcessAdapter::process(AudioUnitRenderActionFlags *actionFlag
     QueuedParamChange qpc;
     while (_hostParamChanges.pop(qpc))
     {
-      _hostParamChangesCount.fetch_sub(1);
+      _hostParamChangesCount.fetch_sub(1, std::memory_order_acq_rel);
       addParameterEvent(qpc.id, qpc.value, 0);
     }
   }
@@ -648,6 +832,7 @@ AUAudioUnitStatus ProcessAdapter::process(AudioUnitRenderActionFlags *actionFlag
   // pair into NOTE_OFF-first order, which otherwise causes stuck notes in
   // plugins that silently drop orphan note-offs.
   reorderSameSampleOrphanOffs(frameCount);
+  finalizeNoteIdsAndActiveNotes();
 
   _processData.frames_count = frameCount;
 
@@ -786,6 +971,14 @@ AUAudioUnitStatus ProcessAdapter::process(AudioUnitRenderActionFlags *actionFlag
             _input_ports[bus].data32[ch] = channel;
           }
         }
+        else
+        {
+          _inputBufferFallbacks.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
+      else
+      {
+        _inputBufferFallbacks.fetch_add(1, std::memory_order_relaxed);
       }
     }
   }
@@ -933,7 +1126,10 @@ copyOutput:
         else if (outputData->mBuffers[ch].mData != source)
         {
           if (outputData->mBuffers[ch].mDataByteSize < frameCount * sizeof(float))
+          {
+            _outputBufferFailures.fetch_add(1, std::memory_order_relaxed);
             return kAudioUnitErr_FormatNotSupported;
+          }
           memcpy(outputData->mBuffers[ch].mData, source, frameCount * sizeof(float));
           _outputCopyCount.fetch_add(1, std::memory_order_relaxed);
         }
@@ -948,13 +1144,17 @@ copyOutput:
       if (destination == nullptr)
       {
         if ((size_t)frameCount * buffer.mNumberChannels > _interleavedOutputStorage.size())
+        {
+          _outputBufferFailures.fetch_add(1, std::memory_order_relaxed);
           return kAudioUnitErr_FormatNotSupported;
+        }
         destination = _interleavedOutputStorage.data();
         buffer.mData = destination;
       }
       else if (buffer.mDataByteSize <
                frameCount * buffer.mNumberChannels * sizeof(float))
       {
+        _outputBufferFailures.fetch_add(1, std::memory_order_relaxed);
         return kAudioUnitErr_FormatNotSupported;
       }
 
@@ -970,6 +1170,11 @@ copyOutput:
         }
       buffer.mDataByteSize = frameCount * stride * sizeof(float);
     }
+    else
+    {
+      _outputBufferFailures.fetch_add(1, std::memory_order_relaxed);
+      return kAudioUnitErr_FormatNotSupported;
+    }
   }
 
   return noErr;
@@ -983,14 +1188,17 @@ void ProcessAdapter::queueParameterChange(clap_id paramId, double value)
   // >4095-entry burst between two render cycles is the lesser evil (the
   // wrapper's value cache already holds the latest value).
   if (_hostParamChangesCount.load() >= kHostParamQueueSize - 1) return;
+  // Reserve before publishing to the lock-free queue. A consumer can observe
+  // the pushed item immediately; incrementing afterward could underflow its
+  // decrement when it drains in that small window.
+  _hostParamChangesCount.fetch_add(1, std::memory_order_release);
   _hostParamChanges.push({paramId, value});
-  _hostParamChangesCount.fetch_add(1);
 }
 
 bool ProcessAdapter::dequeueParameterChange(QueuedParamChange &out)
 {
   if (!_hostParamChanges.pop(out)) return false;
-  _hostParamChangesCount.fetch_sub(1);
+  _hostParamChangesCount.fetch_sub(1, std::memory_order_acq_rel);
   return true;
 }
 
@@ -1062,7 +1270,7 @@ bool ProcessAdapter::enqueueOutputEvent(const clap_event_header_t *event)
   return false;
 }
 
-void ProcessAdapter::addToActiveNotes(const clap_event_note_t *note)
+bool ProcessAdapter::addToActiveNotes(const clap_event_note_t *note)
 {
   for (auto &i : _activeNotes)
   {
@@ -1073,17 +1281,19 @@ void ProcessAdapter::addToActiveNotes(const clap_event_note_t *note)
       i.channel = note->channel;
       i.key = note->key;
       i.used = true;
-      return;
+      return true;
     }
   }
   if (_activeNotes.size() < _capacities.activeNotes)
   {
     _activeNotes.emplace_back(
         ActiveNote{true, note->note_id, note->port_index, note->channel, note->key});
+    return true;
   }
   else
   {
     _activeNoteOverflows.fetch_add(1, std::memory_order_relaxed);
+    return false;
   }
 }
 

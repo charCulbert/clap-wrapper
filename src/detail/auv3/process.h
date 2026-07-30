@@ -14,6 +14,7 @@
 */
 
 #include <clap/clap.h>
+#include <clapwrapper/auv3-param-ramp.h>
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wnullability-completeness"
@@ -36,9 +37,11 @@ typedef union clap_multi_event
   clap_event_header_t header;
   clap_event_note_t note;
   clap_event_midi_t midi;
+  clap_event_midi2_t midi2;
   clap_event_midi_sysex_t sysex;
   clap_event_param_value_t param;
   clap_event_note_expression_t noteexpression;
+  uint8_t custom[64];
 } clap_multi_event_t;
 
 class ProcessAdapter
@@ -66,6 +69,11 @@ class ProcessAdapter
     uint64_t outputEvents = 0;
     uint64_t activeNotes = 0;
     uint64_t reorderScratch = 0;
+    uint64_t parameterRampFallbacks = 0;
+    uint64_t parameterRampTranslationFailures = 0;
+    uint64_t midi2Malformed = 0;
+    uint64_t inputBufferFallbacks = 0;
+    uint64_t outputBufferFailures = 0;
   };
 
   struct VectorCapacities
@@ -147,11 +155,15 @@ class ProcessAdapter
   bool enqueueOutputEvent(const clap_event_header_t *event);
   void translateAUv3Events(const AURenderEvent *head, AUEventSampleTime bufferStartTime,
                            AVAudioFrameCount frameCount);
+  bool appendParameterRamp(const AUParameterEvent &event, clap_id parameterId, void *cookie,
+                           uint32_t sampleOffset, AVAudioFrameCount frameCount);
+  void appendMIDI2Events(const AUMIDIEventList &event, uint32_t sampleOffset);
 
   // Post-sort pass that guards against the AU scheduler reordering
   // same-block NOTE_ON/NOTE_OFF pairs. See process.mm for the full
   // rationale and behaviour.
   void reorderSameSampleOrphanOffs(AVAudioFrameCount frameCount);
+  void finalizeNoteIdsAndActiveNotes();
 
  public:
   // Snapshot of the parameter-id → cookie map, copied at allocate time
@@ -163,6 +175,8 @@ class ProcessAdapter
  private:
   const clap_plugin_t *_plugin = nullptr;
   const clap_plugin_params_t *_ext_params = nullptr;
+  const clap_wrapper_plugin_auv3_param_ramp_t *_paramRampExtension = nullptr;
+  clap_wrapper_auv3_param_ramp_translate_t _paramRampTranslator = nullptr;
   Clap::IAutomation *_automation = nullptr;
 
   uint32_t _numInputs = 0;
@@ -189,6 +203,11 @@ class ProcessAdapter
   std::atomic<uint64_t> _outputEventOverflows{0};
   std::atomic<uint64_t> _activeNoteOverflows{0};
   std::atomic<uint64_t> _reorderScratchOverflows{0};
+  std::atomic<uint64_t> _parameterRampFallbacks{0};
+  std::atomic<uint64_t> _parameterRampTranslationFailures{0};
+  std::atomic<uint64_t> _midi2Malformed{0};
+  std::atomic<uint64_t> _inputBufferFallbacks{0};
+  std::atomic<uint64_t> _outputBufferFailures{0};
   std::atomic<uint64_t> _outputCopyCount{0};
 
   uint32_t _preferred_midi_dialect = CLAP_NOTE_DIALECT_CLAP;
@@ -208,7 +227,7 @@ class ProcessAdapter
   // never constructs/destroys a vector per cycle.
   std::vector<uint32_t> _reorderScratch;
 
-  void addToActiveNotes(const clap_event_note_t *note);
+  bool addToActiveNotes(const clap_event_note_t *note);
   void removeFromActiveNotes(const clap_event_note_t *note);
 
   // AUv3 MIDI events carry no per-note identifier, so the wrapper synthesizes
@@ -239,6 +258,8 @@ class ProcessAdapter
   // but CLAP processes all buses in a single process() call. We run the CLAP
   // process on the first bus pulled in a render cycle (all pulls of one cycle
   // share the same AudioTimeStamp) and just copy stored output for the others.
+  // A single-bus render never reuses a timestamp: its host buffers are only
+  // borrowed for one invocation and matching timestamps can carry new events.
   // The key is (mSampleTime, mHostTime) so an engine restart that reuses a
   // sample time (new host time) is still processed. NaN sentinel: the first
   // comparison is always unequal.

@@ -14,6 +14,7 @@
 */
 
 #include <clap/clap.h>
+#include <clap/ext/event-registry.h>
 #include <vector>
 #include <string>
 #include <memory>
@@ -26,6 +27,7 @@
 
 #include "detail/clap/fsutil.h"
 #include <clap/ext/draft/gain-adjustment-metering.h>
+#include <clapwrapper/event-registry.h>
 
 namespace Clap
 {
@@ -258,6 +260,8 @@ class Plugin
   CLAP_NODISCARD Raise AlwaysAudioThread();
   CLAP_NODISCARD Raise AlwaysMainThread();
 
+  bool queryEventSpace(const char *spaceName, uint16_t *spaceId);
+
  private:
   static const void *clapExtension(const clap_host *host, const char *extension);
   static void clapRequestCallback(const clap_host *host);
@@ -272,6 +276,7 @@ class Plugin
   const std::thread::id _main_thread_id = std::this_thread::get_id();
 
   AudioSetup _audioSetup;
+  EventRegistry _eventRegistry;
 };
 
 class StateMemento
