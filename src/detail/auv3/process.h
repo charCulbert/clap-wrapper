@@ -20,6 +20,7 @@
 
 #import <AudioToolbox/AudioToolbox.h>
 #import <AVFoundation/AVFoundation.h>
+#include <atomic>
 #include <vector>
 #include <map>
 #include <unordered_map>
@@ -43,6 +44,39 @@ typedef union clap_multi_event
 class ProcessAdapter
 {
  public:
+  struct Capacities
+  {
+    static constexpr size_t defaultInputEvents = 8192;
+    static constexpr size_t defaultEventIndices = 8192;
+    static constexpr size_t defaultOutputEvents = 8192;
+    static constexpr size_t defaultActiveNotes = 256;
+    static constexpr size_t defaultReorderScratch = 8192;
+
+    size_t inputEvents = defaultInputEvents;
+    size_t eventIndices = defaultEventIndices;
+    size_t outputEvents = defaultOutputEvents;
+    size_t activeNotes = defaultActiveNotes;
+    size_t reorderScratch = defaultReorderScratch;
+  };
+
+  struct OverflowCounts
+  {
+    uint64_t inputEvents = 0;
+    uint64_t eventIndices = 0;
+    uint64_t outputEvents = 0;
+    uint64_t activeNotes = 0;
+    uint64_t reorderScratch = 0;
+  };
+
+  struct VectorCapacities
+  {
+    size_t inputEvents = 0;
+    size_t eventIndices = 0;
+    size_t outputEvents = 0;
+    size_t activeNotes = 0;
+    size_t reorderScratch = 0;
+  };
+
   ProcessAdapter() = default;
   ~ProcessAdapter();
 
@@ -53,6 +87,12 @@ class ProcessAdapter
                        const clap_plugin_t *plugin, const clap_plugin_params_t *ext_params,
                        Clap::IAutomation *automation, uint32_t numMaxSamples,
                        uint32_t preferredMIDIDialect);
+
+  void setupProcessing(uint32_t numInputBusses, const uint32_t *inputChannelCounts,
+                       uint32_t numOutputBusses, const uint32_t *outputChannelCounts,
+                       const clap_plugin_t *plugin, const clap_plugin_params_t *ext_params,
+                       Clap::IAutomation *automation, uint32_t numMaxSamples,
+                       uint32_t preferredMIDIDialect, const Capacities &capacities);
 
   // Main render call - invoked from the AUv3 internalRenderBlock.
   // Translates AUv3 events, pulls input, calls CLAP process, and writes output.
@@ -88,6 +128,10 @@ class ProcessAdapter
   // cycles ran). Only legal when the render thread is quiesced.
   bool dequeueParameterChange(QueuedParamChange &out);
 
+  OverflowCounts overflowCounts() const;
+  VectorCapacities vectorCapacities() const;
+  uint64_t outputCopyCount() const;
+
   // MIDI output event block (set by the AU host)
   AUMIDIOutputEventBlock __nullable midiOutputEventBlock;
 
@@ -99,6 +143,7 @@ class ProcessAdapter
                                      const clap_event_header_t *event);
 
   void sortEventIndices();
+  bool appendInputEvent(const clap_multi_event_t &event);
   bool enqueueOutputEvent(const clap_event_header_t *event);
   void translateAUv3Events(const AURenderEvent *head, AUEventSampleTime bufferStartTime,
                            AVAudioFrameCount frameCount);
@@ -137,6 +182,14 @@ class ProcessAdapter
   std::vector<clap_multi_event_t> _events;
   std::vector<size_t> _eventindices;
   std::vector<clap_multi_event_t> _outevents;
+  Capacities _capacities;
+
+  std::atomic<uint64_t> _inputEventOverflows{0};
+  std::atomic<uint64_t> _eventIndexOverflows{0};
+  std::atomic<uint64_t> _outputEventOverflows{0};
+  std::atomic<uint64_t> _activeNoteOverflows{0};
+  std::atomic<uint64_t> _reorderScratchOverflows{0};
+  std::atomic<uint64_t> _outputCopyCount{0};
 
   uint32_t _preferred_midi_dialect = CLAP_NOTE_DIALECT_CLAP;
 
@@ -192,8 +245,13 @@ class ProcessAdapter
   double _lastProcessedSampleTime = std::numeric_limits<double>::quiet_NaN();
   uint64_t _lastProcessedHostTime = 0;
   uint32_t _numMaxSamples = 0;
+  std::vector<std::vector<float>> _inputStorage;
+  std::vector<uint32_t> _inputStorageOffset;
   std::vector<std::vector<float>> _outputStorage;  // [_outputStorageOffset[bus] + ch][samples]
   std::vector<uint32_t> _outputStorageOffset;      // per-bus start index into _outputStorage
+  std::vector<float> _interleavedOutputStorage;
+  std::vector<float *> _directOutputPointers;
+  bool _lastRenderUsedDirectOutput = false;
 };
 
 }  // namespace Clap::AUv3

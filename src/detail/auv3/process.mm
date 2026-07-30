@@ -66,10 +66,22 @@ void ProcessAdapter::setupProcessing(uint32_t numInputBusses, const uint32_t *in
                                      Clap::IAutomation *automation, uint32_t numMaxSamples,
                                      uint32_t preferredMIDIDialect)
 {
+  setupProcessing(numInputBusses, inputChannelCounts, numOutputBusses, outputChannelCounts, plugin,
+                  ext_params, automation, numMaxSamples, preferredMIDIDialect, Capacities{});
+}
+
+void ProcessAdapter::setupProcessing(uint32_t numInputBusses, const uint32_t *inputChannelCounts,
+                                     uint32_t numOutputBusses, const uint32_t *outputChannelCounts,
+                                     const clap_plugin_t *plugin, const clap_plugin_params_t *ext_params,
+                                     Clap::IAutomation *automation, uint32_t numMaxSamples,
+                                     uint32_t preferredMIDIDialect,
+                                     const Capacities &capacities)
+{
   _plugin = plugin;
   _ext_params = ext_params;
   _automation = automation;
   _preferred_midi_dialect = preferredMIDIDialect;
+  _capacities = capacities;
 
   // Setup silent buffers
   if (numMaxSamples > 0)
@@ -146,6 +158,14 @@ void ProcessAdapter::setupProcessing(uint32_t numInputBusses, const uint32_t *in
   // Allocate output storage for multi-bus rendering, sized to the actual
   // channel count of each bus (prefix offsets index into the flat array).
   _numMaxSamples = numMaxSamples;
+  _inputStorageOffset.assign(_numInputs + 1, 0);
+  for (uint32_t i = 0; i < _numInputs; ++i)
+  {
+    _inputStorageOffset[i + 1] = _inputStorageOffset[i] + inputChannelCounts[i];
+  }
+  _inputStorage.resize(_inputStorageOffset[_numInputs]);
+  for (auto &buf : _inputStorage) buf.resize(numMaxSamples, 0.0f);
+
   _outputStorageOffset.assign(_numOutputs + 1, 0);
   for (uint32_t i = 0; i < _numOutputs; ++i)
   {
@@ -153,6 +173,12 @@ void ProcessAdapter::setupProcessing(uint32_t numInputBusses, const uint32_t *in
   }
   _outputStorage.resize(_outputStorageOffset[_numOutputs]);
   for (auto &buf : _outputStorage) buf.resize(numMaxSamples, 0.0f);
+  uint32_t maxOutputChannels = 0;
+  for (uint32_t i = 0; i < _numOutputs; ++i)
+    maxOutputChannels = std::max(maxOutputChannels, outputChannelCounts[i]);
+  _interleavedOutputStorage.resize((size_t)maxOutputChannels * numMaxSamples, 0.0f);
+  _directOutputPointers.assign(_outputStorageOffset[_numOutputs], nullptr);
+  _lastRenderUsedDirectOutput = false;
   _lastProcessedSampleTime = std::numeric_limits<double>::quiet_NaN();
 
   // Wire up CLAP process data
@@ -178,22 +204,43 @@ void ProcessAdapter::setupProcessing(uint32_t numInputBusses, const uint32_t *in
   _out_events.try_push = output_events_try_push;
 
   _events.clear();
-  _events.reserve(8192);
+  _events.reserve(_capacities.inputEvents);
   _eventindices.clear();
-  _eventindices.reserve(8192);
-
-  // Reserved up front so enqueueOutputEvent normally never allocates on
-  // the render thread. Should a plugin ever push more than 8192 output
-  // events in one block, we accept the (rare, one-time) growth rather
-  // than drop events — the vector never shrinks, so it amortizes to zero.
+  _eventindices.reserve(_capacities.eventIndices);
   _outevents.clear();
-  _outevents.reserve(8192);
+  _outevents.reserve(_capacities.outputEvents);
 
   _activeNotes.clear();
-  _activeNotes.reserve(32);
+  _activeNotes.reserve(_capacities.activeNotes);
   _reorderScratch.clear();
-  _reorderScratch.reserve(128);
+  _reorderScratch.reserve(_capacities.reorderScratch);
+  _inputEventOverflows.store(0, std::memory_order_relaxed);
+  _eventIndexOverflows.store(0, std::memory_order_relaxed);
+  _outputEventOverflows.store(0, std::memory_order_relaxed);
+  _activeNoteOverflows.store(0, std::memory_order_relaxed);
+  _reorderScratchOverflows.store(0, std::memory_order_relaxed);
+  _outputCopyCount.store(0, std::memory_order_relaxed);
   _nextNoteId = 0;
+}
+
+ProcessAdapter::OverflowCounts ProcessAdapter::overflowCounts() const
+{
+  return {_inputEventOverflows.load(std::memory_order_relaxed),
+          _eventIndexOverflows.load(std::memory_order_relaxed),
+          _outputEventOverflows.load(std::memory_order_relaxed),
+          _activeNoteOverflows.load(std::memory_order_relaxed),
+          _reorderScratchOverflows.load(std::memory_order_relaxed)};
+}
+
+ProcessAdapter::VectorCapacities ProcessAdapter::vectorCapacities() const
+{
+  return {_events.capacity(), _eventindices.capacity(), _outevents.capacity(),
+          _activeNotes.capacity(), _reorderScratch.capacity()};
+}
+
+uint64_t ProcessAdapter::outputCopyCount() const
+{
+  return _outputCopyCount.load(std::memory_order_relaxed);
 }
 
 void ProcessAdapter::setTransportStateBlock(AUHostTransportStateBlock __nullable block)
@@ -215,6 +262,24 @@ void ProcessAdapter::sortEventIndices()
               auto t2 = _events[b].header.time;
               return (t1 == t2) ? (a < b) : (t1 < t2);
             });
+}
+
+bool ProcessAdapter::appendInputEvent(const clap_multi_event_t &event)
+{
+  if (_events.size() >= _capacities.inputEvents)
+  {
+    _inputEventOverflows.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  if (_eventindices.size() >= _capacities.eventIndices)
+  {
+    _eventIndexOverflows.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+
+  _eventindices.emplace_back(_events.size());
+  _events.emplace_back(event);
+  return true;
 }
 
 void ProcessAdapter::reorderSameSampleOrphanOffs(AVAudioFrameCount frameCount)
@@ -244,6 +309,18 @@ void ProcessAdapter::reorderSameSampleOrphanOffs(AVAudioFrameCount frameCount)
   // thread every cycle.
   auto &active = _reorderScratch;
   active.clear();
+
+  size_t noteOnCount = 0;
+  for (auto index : _eventindices)
+  {
+    if (_events[index].header.type == CLAP_EVENT_NOTE_ON) ++noteOnCount;
+  }
+  if (noteOnCount > _capacities.reorderScratch)
+  {
+    _reorderScratchOverflows.fetch_add(noteOnCount - _capacities.reorderScratch,
+                                       std::memory_order_relaxed);
+    return;
+  }
 
   auto packKey = [](int16_t port, int16_t channel, int16_t key) -> uint32_t
   {
@@ -381,8 +458,7 @@ void ProcessAdapter::translateAUv3Events(const AURenderEvent *head, AUEventSampl
         n.param.note_id = -1;
         n.param.cookie = cookieIt->second;
 
-        _eventindices.emplace_back(_events.size());
-        _events.emplace_back(n);
+        appendInputEvent(n);
         break;
       }
 
@@ -410,9 +486,7 @@ void ProcessAdapter::translateAUv3Events(const AURenderEvent *head, AUEventSampl
             n.note.velocity = (float)(me.data[2] & 0x7F) / 127.0f;
             n.note.channel = channel;
 
-            _eventindices.emplace_back(_events.size());
-            _events.emplace_back(n);
-            addToActiveNotes(&n.note);
+            if (appendInputEvent(n)) addToActiveNotes(&n.note);
             break;
           }
           else if (strippedStatus == 0x08 || (strippedStatus == 0x09 && me.data[2] == 0))  // Note Off
@@ -427,9 +501,7 @@ void ProcessAdapter::translateAUv3Events(const AURenderEvent *head, AUEventSampl
             // before removeFromActiveNotes drops the active record).
             n.note.note_id = lookupNoteId(n.note.port_index, n.note.channel, n.note.key);
 
-            _eventindices.emplace_back(_events.size());
-            _events.emplace_back(n);
-            removeFromActiveNotes(&n.note);
+            if (appendInputEvent(n)) removeFromActiveNotes(&n.note);
             break;
           }
           else if (strippedStatus == 0x0A)  // Poly Aftertouch → per-note PRESSURE
@@ -444,8 +516,7 @@ void ProcessAdapter::translateAUv3Events(const AURenderEvent *head, AUEventSampl
                                                     n.noteexpression.channel, n.noteexpression.key);
             n.noteexpression.value = (double)(me.data[2] & 0x7F) / 127.0;
 
-            _eventindices.emplace_back(_events.size());
-            _events.emplace_back(n);
+            appendInputEvent(n);
             break;
           }
           else if (strippedStatus == 0x0D)  // Channel Pressure → channel-wide PRESSURE
@@ -459,8 +530,7 @@ void ProcessAdapter::translateAUv3Events(const AURenderEvent *head, AUEventSampl
             n.noteexpression.note_id = -1;
             n.noteexpression.value = (double)(me.data[1] & 0x7F) / 127.0;
 
-            _eventindices.emplace_back(_events.size());
-            _events.emplace_back(n);
+            appendInputEvent(n);
             break;
           }
           else if (strippedStatus == 0x0E)  // Pitch Bend → channel-wide TUNING
@@ -477,8 +547,7 @@ void ProcessAdapter::translateAUv3Events(const AURenderEvent *head, AUEventSampl
             uint16_t bendValue = ((uint16_t)(me.data[2] & 0x7F) << 7) | (me.data[1] & 0x7F);
             n.noteexpression.value = ((double)bendValue - 8192.0) / 8192.0 * 2.0;
 
-            _eventindices.emplace_back(_events.size());
-            _events.emplace_back(n);
+            appendInputEvent(n);
             break;
           }
         }
@@ -491,8 +560,7 @@ void ProcessAdapter::translateAUv3Events(const AURenderEvent *head, AUEventSampl
         n.midi.data[1] = me.data[1];
         n.midi.data[2] = me.data[2];
 
-        _eventindices.emplace_back(_events.size());
-        _events.emplace_back(n);
+        appendInputEvent(n);
         break;
       }
 
@@ -509,8 +577,7 @@ void ProcessAdapter::translateAUv3Events(const AURenderEvent *head, AUEventSampl
         n.sysex.buffer = se.data;
         n.sysex.size = se.length;
 
-        _eventindices.emplace_back(_events.size());
-        _events.emplace_back(n);
+        appendInputEvent(n);
         break;
       }
 
@@ -527,6 +594,8 @@ AUAudioUnitStatus ProcessAdapter::process(AudioUnitRenderActionFlags *actionFlag
                                           const AURenderEvent *realtimeEventListHead,
                                           AURenderPullInputBlock __unsafe_unretained pullInputBlock)
 {
+  bool useDirectOutput = false;
+
   // Never let the plugin write past the storage sized at allocate time —
   // hosts (and auval) probing beyond maximumFramesToRender must get the
   // documented error, not a heap overrun.
@@ -662,6 +731,10 @@ AUAudioUnitStatus ProcessAdapter::process(AudioUnitRenderActionFlags *actionFlag
   // Pull input audio
   PROCLOG("process: pulling input (_numInputs=%u, pullInputBlock=%{public}s)", _numInputs,
           pullInputBlock ? "yes" : "nil");
+  for (uint32_t bus = 0; bus < _numInputs; ++bus)
+    for (uint32_t ch = 0; ch < _input_ports[bus].channel_count; ++ch)
+      _input_ports[bus].data32[ch] = _silent_input;
+
   if (_numInputs > 0 && pullInputBlock)
   {
     for (uint32_t bus = 0; bus < _numInputs; ++bus)
@@ -684,31 +757,67 @@ AUAudioUnitStatus ProcessAdapter::process(AudioUnitRenderActionFlags *actionFlag
       PROCLOG("process: pull bus %u status=%d", bus, (int)status);
       if (status == noErr)
       {
-        for (uint32_t ch = 0; ch < numCh && ch < _inputBufferList->mNumberBuffers; ++ch)
+        bool planar = _inputBufferList->mNumberBuffers >= numCh;
+        for (uint32_t ch = 0; planar && ch < numCh; ++ch)
         {
-          _input_ports[bus].data32[ch] = (float *)_inputBufferList->mBuffers[ch].mData;
+          const auto &buffer = _inputBufferList->mBuffers[ch];
+          planar = buffer.mNumberChannels == 1 && buffer.mData != nullptr &&
+                   buffer.mDataByteSize >= frameCount * sizeof(float);
         }
-      }
-      else
-      {
-        // Fill with silence on pull failure
-        for (uint32_t ch = 0; ch < numCh; ++ch)
+
+        if (planar)
         {
-          _input_ports[bus].data32[ch] = _silent_input;
+          for (uint32_t ch = 0; ch < numCh; ++ch)
+            _input_ports[bus].data32[ch] = (float *)_inputBufferList->mBuffers[ch].mData;
+        }
+        else if (_inputBufferList->mNumberBuffers == 1 &&
+                 _inputBufferList->mBuffers[0].mNumberChannels >= numCh &&
+                 _inputBufferList->mBuffers[0].mData != nullptr &&
+                 _inputBufferList->mBuffers[0].mDataByteSize >=
+                     frameCount * _inputBufferList->mBuffers[0].mNumberChannels * sizeof(float))
+        {
+          auto *interleaved = (const float *)_inputBufferList->mBuffers[0].mData;
+          const uint32_t stride = _inputBufferList->mBuffers[0].mNumberChannels;
+          for (uint32_t ch = 0; ch < numCh; ++ch)
+          {
+            auto *channel = _inputStorage[_inputStorageOffset[bus] + ch].data();
+            for (uint32_t frame = 0; frame < frameCount; ++frame)
+              channel[frame] = interleaved[(size_t)frame * stride + ch];
+            _input_ports[bus].data32[ch] = channel;
+          }
         }
       }
     }
   }
 
-  // Point all output ports to our internal storage so CLAP writes there
-  for (uint32_t bus = 0; bus < _numOutputs; ++bus)
+  useDirectOutput = _numOutputs == 1 && outputBusNumber == 0 && outputData != nullptr &&
+                    outputData->mNumberBuffers >= _output_ports[0].channel_count;
+  for (uint32_t ch = 0; useDirectOutput && ch < _output_ports[0].channel_count; ++ch)
   {
-    uint32_t numCh = _output_ports[bus].channel_count;
-    for (uint32_t ch = 0; ch < numCh; ++ch)
+    const auto &buffer = outputData->mBuffers[ch];
+    useDirectOutput = buffer.mNumberChannels == 1 && buffer.mData != nullptr &&
+                      buffer.mDataByteSize >= frameCount * sizeof(float);
+  }
+
+  if (useDirectOutput)
+  {
+    for (uint32_t ch = 0; ch < _output_ports[0].channel_count; ++ch)
     {
-      _output_ports[bus].data32[ch] = _outputStorage[_outputStorageOffset[bus] + ch].data();
+      auto *hostBuffer = (float *)outputData->mBuffers[ch].mData;
+      _output_ports[0].data32[ch] = hostBuffer;
+      _directOutputPointers[ch] = hostBuffer;
     }
   }
+  else
+  {
+    for (uint32_t bus = 0; bus < _numOutputs; ++bus)
+    {
+      uint32_t numCh = _output_ports[bus].channel_count;
+      for (uint32_t ch = 0; ch < numCh; ++ch)
+        _output_ports[bus].data32[ch] = _outputStorage[_outputStorageOffset[bus] + ch].data();
+    }
+  }
+  _lastRenderUsedDirectOutput = useDirectOutput;
 
   // Process once for all buses
   _plugin->process(_plugin, &_processData);
@@ -804,25 +913,62 @@ AUAudioUnitStatus ProcessAdapter::process(AudioUnitRenderActionFlags *actionFlag
   _outevents.clear();
 
 copyOutput:
-  // Hand the stored output to the host for this bus. A null mData is the
-  // host asking the AU to provide its own buffer (auval exercises this) —
-  // point it at our storage instead of skipping the channel.
   if (outputData && outputBusNumber >= 0 && outputBusNumber < (NSInteger)_numOutputs)
   {
     uint32_t outBus = (uint32_t)outputBusNumber;
-    uint32_t numCh = std::min((uint32_t)outputData->mNumberBuffers, _output_ports[outBus].channel_count);
-    for (uint32_t ch = 0; ch < numCh; ++ch)
+    uint32_t numCh = _output_ports[outBus].channel_count;
+    bool planar = outputData->mNumberBuffers >= numCh;
+    for (uint32_t ch = 0; planar && ch < numCh; ++ch)
+      planar = outputData->mBuffers[ch].mNumberChannels == 1;
+
+    if (planar)
     {
-      auto &storage = _outputStorage[_outputStorageOffset[outBus] + ch];
-      if (outputData->mBuffers[ch].mData == nullptr)
+      for (uint32_t ch = 0; ch < numCh; ++ch)
       {
-        outputData->mBuffers[ch].mData = storage.data();
+        auto *source = _lastRenderUsedDirectOutput
+                           ? _directOutputPointers[_outputStorageOffset[outBus] + ch]
+                           : _outputStorage[_outputStorageOffset[outBus] + ch].data();
+        if (outputData->mBuffers[ch].mData == nullptr)
+          outputData->mBuffers[ch].mData = source;
+        else if (outputData->mBuffers[ch].mData != source)
+        {
+          if (outputData->mBuffers[ch].mDataByteSize < frameCount * sizeof(float))
+            return kAudioUnitErr_FormatNotSupported;
+          memcpy(outputData->mBuffers[ch].mData, source, frameCount * sizeof(float));
+          _outputCopyCount.fetch_add(1, std::memory_order_relaxed);
+        }
+        outputData->mBuffers[ch].mDataByteSize = frameCount * sizeof(float);
       }
-      else
+    }
+    else if (outputData->mNumberBuffers > 0 &&
+             outputData->mBuffers[0].mNumberChannels >= numCh)
+    {
+      auto &buffer = outputData->mBuffers[0];
+      auto *destination = (float *)buffer.mData;
+      if (destination == nullptr)
       {
-        memcpy(outputData->mBuffers[ch].mData, storage.data(), frameCount * sizeof(float));
+        if ((size_t)frameCount * buffer.mNumberChannels > _interleavedOutputStorage.size())
+          return kAudioUnitErr_FormatNotSupported;
+        destination = _interleavedOutputStorage.data();
+        buffer.mData = destination;
       }
-      outputData->mBuffers[ch].mDataByteSize = frameCount * sizeof(float);
+      else if (buffer.mDataByteSize <
+               frameCount * buffer.mNumberChannels * sizeof(float))
+      {
+        return kAudioUnitErr_FormatNotSupported;
+      }
+
+      const uint32_t stride = buffer.mNumberChannels;
+      _outputCopyCount.fetch_add(1, std::memory_order_relaxed);
+      for (uint32_t frame = 0; frame < frameCount; ++frame)
+        for (uint32_t ch = 0; ch < numCh; ++ch)
+        {
+          auto *source = _lastRenderUsedDirectOutput
+                             ? _directOutputPointers[_outputStorageOffset[outBus] + ch]
+                             : _outputStorage[_outputStorageOffset[outBus] + ch].data();
+          destination[(size_t)frame * stride + ch] = source[frame];
+        }
+      buffer.mDataByteSize = frameCount * stride * sizeof(float);
     }
   }
 
@@ -870,8 +1016,7 @@ void ProcessAdapter::addParameterEvent(clap_id paramId, double value, uint32_t s
   n.param.channel = -1;
   n.param.note_id = -1;
 
-  _eventindices.emplace_back(_events.size());
-  _events.emplace_back(n);
+  appendInputEvent(n);
 }
 
 // --- CLAP event callbacks ---
@@ -879,14 +1024,14 @@ void ProcessAdapter::addParameterEvent(clap_id paramId, double value, uint32_t s
 uint32_t ProcessAdapter::input_events_size(const struct clap_input_events *list)
 {
   auto self = static_cast<ProcessAdapter *>(list->ctx);
-  return (uint32_t)self->_events.size();
+  return (uint32_t)self->_eventindices.size();
 }
 
 const clap_event_header_t *ProcessAdapter::input_events_get(const struct clap_input_events *list,
                                                             uint32_t index)
 {
   auto self = static_cast<ProcessAdapter *>(list->ctx);
-  if (index < self->_events.size())
+  if (index < self->_eventindices.size())
   {
     auto realindex = self->_eventindices[index];
     return &(self->_events[realindex].header);
@@ -903,13 +1048,17 @@ bool ProcessAdapter::output_events_try_push(const struct clap_output_events *lis
 
 bool ProcessAdapter::enqueueOutputEvent(const clap_event_header_t *event)
 {
-  if (event->size <= sizeof(clap_multi_event_t))
+  if (event != nullptr && event->size >= sizeof(clap_event_header_t) &&
+      event->size <= sizeof(clap_multi_event_t) &&
+      _outevents.size() < _capacities.outputEvents)
   {
     clap_multi_event_t e;
+    memset(&e, 0, sizeof(e));
     memcpy(&e, event, event->size);
     _outevents.emplace_back(e);
     return true;
   }
+  _outputEventOverflows.fetch_add(1, std::memory_order_relaxed);
   return false;
 }
 
@@ -927,7 +1076,15 @@ void ProcessAdapter::addToActiveNotes(const clap_event_note_t *note)
       return;
     }
   }
-  _activeNotes.emplace_back(ActiveNote{true, note->note_id, note->port_index, note->channel, note->key});
+  if (_activeNotes.size() < _capacities.activeNotes)
+  {
+    _activeNotes.emplace_back(
+        ActiveNote{true, note->note_id, note->port_index, note->channel, note->key});
+  }
+  else
+  {
+    _activeNoteOverflows.fetch_add(1, std::memory_order_relaxed);
+  }
 }
 
 void ProcessAdapter::removeFromActiveNotes(const clap_event_note_t *note)
