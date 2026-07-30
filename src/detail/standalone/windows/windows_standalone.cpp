@@ -998,6 +998,7 @@ Plugin::Plugin(std::shared_ptr<Clap::Plugin> clapPlugin, int nCmdShow)
              {
                if (msg.wparam == timerId)
                {
+                 sah->serviceParameterFlushRequestOnMainThread();
                  if (sah->callbackRequested.exchange(false))
                  {
                    plugin.plugin->on_main_thread(plugin.plugin);

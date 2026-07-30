@@ -26,6 +26,7 @@
 
 #include "clap_proxy.h"
 #include "detail/shared/fixedqueue.h"
+#include "detail/shared/parameter_flush.h"
 #include "detail/shared/spinlock.h"
 
 namespace freeaudio::clap_wrapper::standalone
@@ -153,7 +154,10 @@ struct StandaloneHost : Clap::IHost
   }
   void param_request_flush() override
   {
+    parameterFlushRequested.store(true, std::memory_order_release);
   }
+  std::atomic_bool parameterFlushRequested{false};
+  void serviceParameterFlushRequestOnMainThread();
 
   bool gui_can_resize() override;
 
@@ -278,7 +282,7 @@ struct StandaloneHost : Clap::IHost
   }
 
   void activatePlugin(int32_t sr, int32_t minBlock, int32_t maxBlock);
-  bool isActive{false};
+  std::atomic_bool isActive{false};
 
   std::vector<RtAudio::Api> getCompiledApi();
   std::vector<RtAudio::DeviceInfo> getInputAudioDevices();

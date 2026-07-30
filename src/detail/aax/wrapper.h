@@ -40,6 +40,7 @@
 // Wrapper
 #include "detail/os/osutil.h"
 #include "detail/clap/automation.h"
+#include "detail/shared/parameter_flush.h"
 #include "clap_proxy.h"
 #include "parameter.h"
 #include "process.h"
@@ -230,6 +231,7 @@ class ClapAsAAX : public AAX_CEffectParameters,
                           int32_t y) override;
 
   void onIdle() override;
+  void serviceParameterFlushRequestOnMainThread();
 
   void activatePlugin();
   void deactivatePlugin();

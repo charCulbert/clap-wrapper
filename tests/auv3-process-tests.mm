@@ -22,6 +22,8 @@ struct TestState
   bool processActive = false;
   uint32_t parameterFlushCalls = 0;
   bool parameterFlushPushResults[3] = {};
+  bool retryRejectedFlushEvents = false;
+  uint32_t nextFlushEvent = 0;
   uint32_t inputEventCount = 0;
   bool inputEventsSorted = true;
   uint32_t processCalls = 0;
@@ -223,6 +225,18 @@ void CLAP_ABI flushPlugin(const clap_plugin_t *plugin, const clap_input_events_t
   clap_event_param_gesture_t end{};
   end.header = {sizeof(end), 0, CLAP_CORE_EVENT_SPACE_ID, CLAP_EVENT_PARAM_GESTURE_END, 0};
   end.param_id = 42;
+  if (state.retryRejectedFlushEvents)
+  {
+    const clap_event_header_t *events[] = {&begin.header, &value.header, &end.header};
+    while (state.nextFlushEvent < std::size(events))
+    {
+      const auto index = state.nextFlushEvent;
+      state.parameterFlushPushResults[index] = output->try_push(output, events[index]);
+      if (!state.parameterFlushPushResults[index]) break;
+      ++state.nextFlushEvent;
+    }
+    return;
+  }
   state.parameterFlushPushResults[0] = output->try_push(output, &begin.header);
   state.parameterFlushPushResults[1] = output->try_push(output, &value.header);
   state.parameterFlushPushResults[2] = output->try_push(output, &end.header);
@@ -1094,12 +1108,67 @@ bool testInactivePluginRequestedParameterFlush()
                 "inactive flush delivers begin/value/end to the update queue");
 }
 
+bool testInactiveFlushBackpressureRetry()
+{
+  struct Sink
+  {
+    TestAutomation automation;
+    uint32_t acceptedThisCall = 0;
+  } sink;
+
+  TestState state;
+  state.emitParameterFlushEvents = true;
+  state.retryRejectedFlushEvents = true;
+  auto plugin = makePlugin(state);
+  std::atomic_bool requestFlush{true};
+  clap_output_events_t output{};
+  output.ctx = &sink;
+  output.try_push = [](const clap_output_events_t *list, const clap_event_header_t *event) -> bool
+  {
+    auto *target = static_cast<Sink *>(list->ctx);
+    if (target->acceptedThisCall >= 2) return false;
+    ++target->acceptedThisCall;
+    switch (event->type)
+    {
+      case CLAP_EVENT_PARAM_GESTURE_BEGIN:
+        target->automation.onBeginEdit(
+            reinterpret_cast<const clap_event_param_gesture_t *>(event)->param_id);
+        return true;
+      case CLAP_EVENT_PARAM_VALUE:
+        target->automation.onPerformEdit(reinterpret_cast<const clap_event_param_value_t *>(event));
+        return true;
+      case CLAP_EVENT_PARAM_GESTURE_END:
+        target->automation.onEndEdit(
+            reinterpret_cast<const clap_event_param_gesture_t *>(event)->param_id);
+        return true;
+      default:
+        return false;
+    }
+  };
+
+  Clap::AUv3::serviceParameterFlushRequest(&plugin, &testParams, &requestFlush, &output);
+  const bool retryPending = requestFlush.load(std::memory_order_acquire);
+  sink.acceptedThisCall = 0;
+  Clap::AUv3::serviceParameterFlushRequest(&plugin, &testParams, &requestFlush, &output);
+
+  return expect(retryPending && !requestFlush.load(std::memory_order_acquire),
+                "inactive backpressure re-arms and clears after retry") &&
+         expect(state.parameterFlushCalls == 2 && state.nextFlushEvent == 3,
+                "inactive retry services the exact pending event") &&
+         expect(sink.automation.count == 3 &&
+                    sink.automation.events[0].type == TestAutomation::Type::begin &&
+                    sink.automation.events[1].type == TestAutomation::Type::value &&
+                    sink.automation.events[2].type == TestAutomation::Type::end,
+                "inactive retry preserves gesture ordering");
+}
+
 bool testPluginRequestedFlushOutputCapacity()
 {
   constexpr uint32_t frames = 8;
   uint32_t channels[] = {1};
   TestState state;
   state.emitParameterFlushEvents = true;
+  state.retryRejectedFlushEvents = true;
   TestAutomation automation;
   auto plugin = makePlugin(state);
   std::atomic_bool requestFlush{true};
@@ -1115,14 +1184,25 @@ bool testPluginRequestedFlushOutputCapacity()
   AudioUnitRenderActionFlags flags = 0;
   auto time = timestamp(0, 102);
   adapter.process(&flags, &time, frames, 0, output.get(), nullptr, nil);
+  const bool firstBegin = state.parameterFlushPushResults[0];
+  const bool firstValue = state.parameterFlushPushResults[1];
+  const bool firstEnd = state.parameterFlushPushResults[2];
+  const auto firstOverflow = adapter.overflowCounts().outputEvents;
+  const bool retryWasPending = requestFlush.load(std::memory_order_acquire);
 
-  return expect(state.parameterFlushPushResults[0] && state.parameterFlushPushResults[1] &&
-                    !state.parameterFlushPushResults[2], "flush observes bounded output capacity") &&
-         expect(adapter.overflowCounts().outputEvents == 1,
+  time = timestamp(8, 103);
+  adapter.process(&flags, &time, frames, 0, output.get(), nullptr, nil);
+
+  return expect(firstBegin && firstValue && !firstEnd, "flush observes bounded output capacity") &&
+         expect(firstOverflow == 1,
                 "flush output capacity overflow is diagnostic") &&
-         expect(automation.count == 2 && automation.events[0].type == TestAutomation::Type::begin &&
-                    automation.events[1].type == TestAutomation::Type::value,
-                "admitted flush events retain ordering");
+         expect(retryWasPending && !requestFlush.load(std::memory_order_acquire) &&
+                    state.parameterFlushCalls == 2,
+                "rejected flush output retries automatically") &&
+         expect(automation.count == 3 && automation.events[0].type == TestAutomation::Type::begin &&
+                    automation.events[1].type == TestAutomation::Type::value &&
+                    automation.events[2].type == TestAutomation::Type::end,
+                "retry preserves the exact pending event and ordering");
 }
 }  // namespace
 
@@ -1149,6 +1229,7 @@ int main()
   ok &= testMalformedMIDI2EventList();
   ok &= testPluginRequestedParameterFlush();
   ok &= testInactivePluginRequestedParameterFlush();
+  ok &= testInactiveFlushBackpressureRetry();
   ok &= testPluginRequestedFlushOutputCapacity();
   if (ok) std::cout << "AUv3 process tests passed\n";
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;

@@ -28,14 +28,21 @@
 #include <limits>
 #include "../clap/automation.h"
 #include "../shared/fixedqueue.h"
+#include "../shared/parameter_flush.h"
 
 namespace Clap::AUv3
 {
 
 // Consume one coalesced host flush request using an empty input event list.
 // The caller supplies the appropriate output sink and thread context.
-bool serviceParameterFlushRequest(const clap_plugin_t *plugin, const clap_plugin_params_t *params,
-                                  std::atomic_bool *requestFlag, const clap_output_events_t *output);
+inline bool serviceParameterFlushRequest(const clap_plugin_t *plugin,
+                                         const clap_plugin_params_t *params,
+                                         std::atomic_bool *requestFlag,
+                                         const clap_output_events_t *output)
+{
+  return ClapWrapper::detail::shared::serviceParameterFlushRequest(plugin, params, requestFlag,
+                                                                    output);
+}
 
 typedef union clap_multi_event
 {

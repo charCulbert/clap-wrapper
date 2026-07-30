@@ -208,6 +208,8 @@ void StandaloneHost::clapProcess(void *pOutput, const void *pInput, uint32_t fra
     pushInputEvent(&(midi.header));
   }
 
+  // process() is the active bidirectional parameter transport.
+  parameterFlushRequested.store(false, std::memory_order_release);
   clapPlugin->_plugin->process(clapPlugin->_plugin, &process);
 
   for (auto i = 0U; i < frameCount; ++i)
@@ -240,6 +242,15 @@ bool StandaloneHost::gui_request_resize(uint32_t width, uint32_t height)
 const char *StandaloneHost::host_get_name()
 {
   return "CLAP-Wrapper-As-Standalone";
+}
+
+void StandaloneHost::serviceParameterFlushRequestOnMainThread()
+{
+  if (isActive.load(std::memory_order_acquire) || !clapPlugin || !clapPlugin->_ext._params) return;
+
+  auto mainThread = clapPlugin->AlwaysMainThread();
+  ClapWrapper::detail::shared::serviceParameterFlushRequest(
+      clapPlugin->_plugin, clapPlugin->_ext._params, &parameterFlushRequested, &outputEvents);
 }
 
 #if LIN
@@ -366,21 +377,29 @@ bool StandaloneHost::tryLoadStandaloneAndPluginSettings(const fs::path &fromDir,
 
 void StandaloneHost::activatePlugin(int32_t sr, int32_t minBlock, int32_t maxBlock)
 {
-  if (isActive)
+  if (isActive.load(std::memory_order_acquire))
   {
     clapPlugin->stop_processing();
     clapPlugin->deactivate();
-    isActive = false;
+    isActive.store(false, std::memory_order_release);
   }
 
   LOGINFO("Activating plugin : sampleRate={} blockBounds={} to {}", sr, minBlock, maxBlock);
   clapPlugin->setSampleRate(sr);
   clapPlugin->setBlockSizes(minBlock, maxBlock);
-  clapPlugin->activate();
+  // Gate idle flushes across the lifecycle transition as well as processing.
+  isActive.store(true, std::memory_order_release);
+  if (!clapPlugin->activate())
+  {
+    isActive.store(false, std::memory_order_release);
+    return;
+  }
 
-  clapPlugin->start_processing();
-
-  isActive = true;
+  if (!clapPlugin->start_processing())
+  {
+    clapPlugin->deactivate();
+    isActive.store(false, std::memory_order_release);
+  }
 }
 
 }  // namespace freeaudio::clap_wrapper::standalone

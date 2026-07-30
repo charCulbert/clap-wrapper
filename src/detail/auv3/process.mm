@@ -28,21 +28,6 @@ inline clap_sectime doubleToSecTime(double t)
   return std::round(t * CLAP_SECTIME_FACTOR);
 }
 
-bool serviceParameterFlushRequest(const clap_plugin_t *plugin, const clap_plugin_params_t *params,
-                                  std::atomic_bool *requestFlag, const clap_output_events_t *output)
-{
-  if (plugin == nullptr || params == nullptr || params->flush == nullptr || requestFlag == nullptr ||
-      output == nullptr || !requestFlag->exchange(false, std::memory_order_acq_rel))
-    return false;
-
-  clap_input_events_t emptyInput = {};
-  emptyInput.size = [](const clap_input_events_t *) -> uint32_t { return 0; };
-  emptyInput.get = [](const clap_input_events_t *, uint32_t) -> const clap_event_header_t *
-  { return nullptr; };
-  params->flush(plugin, &emptyInput, output);
-  return true;
-}
-
 ProcessAdapter::~ProcessAdapter()
 {
   if (_input_ports)

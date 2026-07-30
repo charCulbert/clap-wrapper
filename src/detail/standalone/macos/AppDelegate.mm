@@ -30,6 +30,7 @@
 - (void)timerCallback:(NSTimer *)instance
 {
   auto *standaloneHost = freeaudio::clap_wrapper::standalone::getStandaloneHost();
+  standaloneHost->serviceParameterFlushRequestOnMainThread();
   if (standaloneHost->callbackRequested.exchange(false))
   {
     auto *plugin = freeaudio::clap_wrapper::standalone::getMainPlugin()->_plugin;

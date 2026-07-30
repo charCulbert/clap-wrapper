@@ -31,6 +31,7 @@ struct X11Gui
   static constexpr size_t maxEpollEvents{256};
 
   std::shared_ptr<Clap::Plugin> plugin{nullptr};
+  freeaudio::clap_wrapper::standalone::StandaloneHost *host{nullptr};
 
   bool resetSizeTo(int w, int h);
 

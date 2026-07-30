@@ -136,6 +136,7 @@ class AUv3ImplDetail : public Clap::IHost, public Clap::IAutomation, public os::
   os::State _os_attached;
   std::string _hostname = "CLAP-as-AUv3";
   std::atomic<bool> _initialized{false};
+  std::atomic_bool _parameterFlushRequiresAudioThread{false};
   std::atomic_bool _requestUICallback{false};
   std::atomic_bool _parameterFlushRequested{false};
   dispatch_source_t _idleTimer = nullptr;
@@ -160,6 +161,7 @@ class AUv3ImplDetail : public Clap::IHost, public Clap::IAutomation, public os::
   // unordered_map mutation under concurrency is bucket corruption, not a
   // benign stale read. The mutex is never held across a plugin call.
   std::mutex _paramCacheMutex;
+  std::mutex _parameterFlushLifecycleMutex;
   std::unordered_map<clap_id, double> _paramValueCache;
   std::unordered_map<clap_id, void *> _paramCookieCache;
 
@@ -211,7 +213,7 @@ class AUv3ImplDetail : public Clap::IHost, public Clap::IAutomation, public os::
 
     auto plugin = _plugin;
     auto *flag = &_requestUICallback;
-    auto *processing = &_initialized;  // true between start_processing/stop_processing
+    auto *processing = &_parameterFlushRequiresAudioThread;
     auto *self = this;
     dispatch_source_set_event_handler(_idleTimer, ^{
       // Drain the parameter automation queue (Touch/Value/Release → host).
@@ -657,8 +659,12 @@ class AUv3ImplDetail : public Clap::IHost, public Clap::IAutomation, public os::
 
   void serviceParameterFlushRequestOnMainThread()
   {
-    if (_initialized.load(std::memory_order_acquire) || !_plugin || !_plugin->_ext._params)
+    if (_parameterFlushRequiresAudioThread.load(std::memory_order_acquire) || !_plugin ||
+        !_plugin->_ext._params)
       return;
+
+    std::lock_guard<std::mutex> lifecycleLock(_parameterFlushLifecycleMutex);
+    if (_parameterFlushRequiresAudioThread.load(std::memory_order_acquire)) return;
 
     clap_output_events_t output = {};
     output.ctx = this;
@@ -669,17 +675,31 @@ class AUv3ImplDetail : public Clap::IHost, public Clap::IAutomation, public os::
       switch (event->type)
       {
         case CLAP_EVENT_PARAM_VALUE:
+        {
           if (event->size < sizeof(clap_event_param_value_t)) return false;
-          self->onPerformEdit(reinterpret_cast<const clap_event_param_value_t *>(event));
-          return true;
+          queueEvent queued;
+          queued._type = queueEvent::type::editvalue;
+          queued._data._value = *reinterpret_cast<const clap_event_param_value_t *>(event);
+          return self->enqueueParameterOutputEvent(queued);
+        }
         case CLAP_EVENT_PARAM_GESTURE_BEGIN:
+        {
           if (event->size < sizeof(clap_event_param_gesture_t)) return false;
-          self->onBeginEdit(reinterpret_cast<const clap_event_param_gesture_t *>(event)->param_id);
-          return true;
+          queueEvent queued;
+          queued._type = queueEvent::type::editstart;
+          queued._data._id =
+              reinterpret_cast<const clap_event_param_gesture_t *>(event)->param_id;
+          return self->enqueueParameterOutputEvent(queued);
+        }
         case CLAP_EVENT_PARAM_GESTURE_END:
+        {
           if (event->size < sizeof(clap_event_param_gesture_t)) return false;
-          self->onEndEdit(reinterpret_cast<const clap_event_param_gesture_t *>(event)->param_id);
-          return true;
+          queueEvent queued;
+          queued._type = queueEvent::type::editend;
+          queued._data._id =
+              reinterpret_cast<const clap_event_param_gesture_t *>(event)->param_id;
+          return self->enqueueParameterOutputEvent(queued);
+        }
         default:
           return true;
       }
@@ -1581,8 +1601,29 @@ static Clap::Library _library;
   }
 
   // Activate the CLAP plugin
+  // Publish the flush gate before activate/start. The main timer must not
+  // enter params.flush() while either lifecycle call is in progress.
+  _impl->_parameterFlushRequiresAudioThread.store(true, std::memory_order_release);
+  std::lock_guard<std::mutex> flushLifecycleLock(_impl->_parameterFlushLifecycleMutex);
   AUV3LOG("allocateRenderResources: calling activate()");
-  _impl->_plugin->activate();
+  if (!_impl->_plugin->activate())
+  {
+    _impl->_processAdapterLive.store(nullptr);
+    _impl->_parameterFlushRequiresAudioThread.store(false, std::memory_order_release);
+    {
+      std::lock_guard<std::mutex> lock(_impl->_paramCacheMutex);
+      _renderResourcesAllocated = NO;
+    }
+    _impl->_processAdapter.reset();
+    [super deallocateRenderResources];
+    if (outError)
+      *outError = [NSError errorWithDomain:@"ClapAUv3"
+                                      code:-11
+                                  userInfo:@{
+                                    NSLocalizedDescriptionKey : @"CLAP plugin activation failed"
+                                  }];
+    return NO;
+  }
 
   // Re-cache latency — the plugin may have set it during activation
   if (_impl->_plugin->_ext._latency)
@@ -1598,7 +1639,25 @@ static Clap::Library _library;
   }
 
   AUV3LOG("allocateRenderResources: calling start_processing()");
-  _impl->_plugin->start_processing();
+  if (!_impl->_plugin->start_processing())
+  {
+    _impl->_plugin->deactivate();
+    _impl->_processAdapterLive.store(nullptr);
+    _impl->_parameterFlushRequiresAudioThread.store(false, std::memory_order_release);
+    {
+      std::lock_guard<std::mutex> lock(_impl->_paramCacheMutex);
+      _renderResourcesAllocated = NO;
+    }
+    _impl->_processAdapter.reset();
+    [super deallocateRenderResources];
+    if (outError)
+      *outError = [NSError errorWithDomain:@"ClapAUv3"
+                                      code:-12
+                                  userInfo:@{
+                                    NSLocalizedDescriptionKey : @"CLAP plugin start_processing failed"
+                                  }];
+    return NO;
+  }
   _impl->_initialized = true;
 
   AUV3LOG("allocateRenderResources: completed successfully");
@@ -1631,7 +1690,6 @@ static Clap::Library _library;
     _impl->_plugin->deactivate();
     _impl->_initialized = false;
   }
-
   if (_impl)
   {
     // Producers (implementorValueObserver, bypass setter) check this flag
@@ -1659,6 +1717,8 @@ static Clap::Library _library;
 
   AUV3LOG("deallocateRenderResources: resetting process adapter");
   _impl->_processAdapter.reset();
+  if (_impl)
+    _impl->_parameterFlushRequiresAudioThread.store(false, std::memory_order_release);
 
   AUV3LOG("deallocateRenderResources: calling [super deallocateRenderResources]");
   [super deallocateRenderResources];

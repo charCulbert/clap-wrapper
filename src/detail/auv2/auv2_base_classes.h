@@ -24,6 +24,7 @@
 #include "process.h"
 #include "parameter.h"
 #include "detail/shared/fixedqueue.h"
+#include "detail/shared/parameter_flush.h"
 #include "detail/os/osutil.h"
 #include "detail/clap/automation.h"
 
@@ -385,6 +386,7 @@ class WrapAsAUV2 : public ausdk::AUBase,
   }
   void param_request_flush() override
   {
+    _parameterFlushRequested.store(true, std::memory_order_release);
   }
 
   void latency_changed() override;
@@ -480,6 +482,7 @@ class WrapAsAUV2 : public ausdk::AUBase,
 
   // --------------- IPlugObject
   void onIdle() override;
+  void serviceParameterFlushRequestOnMainThread();
 
   // context menu extension
   bool supportsContextMenu() const override
@@ -537,6 +540,7 @@ class WrapAsAUV2 : public ausdk::AUBase,
 
   std::unique_ptr<Clap::AUv2::ProcessAdapter> _processAdapter;
   std::atomic<bool> _initialized = false;
+  std::atomic_bool _parameterFlushRequested = false;
 
   // some info about the wrapped clap
   uint32_t _midi_preferred_dialect = 0;

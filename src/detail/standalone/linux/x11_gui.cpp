@@ -27,6 +27,7 @@ void X11Gui::initialize(freeaudio::clap_wrapper::standalone::StandaloneHost *sah
     exit(1);
   }
   sah->x11Gui = this;
+  host = sah;
   sah->onRequestResize = [this](int w, int h) { return resetSizeTo(w, h); };
   epoll_fd = epoll_create1(EPOLL_CLOEXEC);
   if (epoll_fd < 0)
@@ -42,6 +43,7 @@ void X11Gui::runloop()
     // no gui. Only way to kill us is with a signal.
     while (true)
     {
+      if (host) host->serviceParameterFlushRequestOnMainThread();
       std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     }
     return;
@@ -51,6 +53,7 @@ void X11Gui::runloop()
   bool running{true};
   while (running)
   {
+    if (host) host->serviceParameterFlushRequestOnMainThread();
     while (XPending(display))
     {
       XNextEvent(display, &e);
