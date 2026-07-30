@@ -1,5 +1,6 @@
 
 #include <cassert>
+#include <chrono>
 #include "standalone_host.h"
 #include "standalone_settings.h"
 #include <fstream>
@@ -105,6 +106,22 @@ bool CLAP_ABI enqueueEvent(const clap_host_t *host, const clap_event_header_t *e
   return standalone != nullptr && standalone->services.enqueueEvent(event, eventSize, timestampNs);
 }
 
+bool CLAP_ABI enqueueTimestampedEvent(const clap_host_t *host, const clap_event_header_t *event,
+                                      uint32_t eventSize, uint64_t timestampNs)
+{
+  auto *standalone = standaloneHostFor(host);
+  return standalone != nullptr &&
+         standalone->services.enqueueTimestampedEvent(event, eventSize, timestampNs);
+}
+
+bool CLAP_ABI dequeueOutputEvent(const clap_host_t *host, void *event, uint32_t eventCapacity,
+                                 clap_wrapper_standalone_output_event_info_t *info)
+{
+  auto *standalone = standaloneHostFor(host);
+  return standalone != nullptr && info != nullptr &&
+         standalone->services.dequeueOutputEvent(event, eventCapacity, *info);
+}
+
 bool CLAP_ABI getEventTelemetry(const clap_host_t *host,
                                 clap_wrapper_standalone_event_telemetry_t *telemetry)
 {
@@ -116,6 +133,17 @@ bool CLAP_ABI getEventTelemetry(const clap_host_t *host,
   return true;
 }
 
+bool CLAP_ABI getOutputEventTelemetry(const clap_host_t *host,
+                                      clap_wrapper_standalone_event_telemetry_t *telemetry)
+{
+  auto *standalone = standaloneHostFor(host);
+  if (standalone == nullptr || telemetry == nullptr ||
+      telemetry->struct_size < sizeof(clap_wrapper_standalone_event_telemetry_t))
+    return false;
+  standalone->services.getOutputTelemetry(*telemetry);
+  return true;
+}
+
 const clap_wrapper_host_standalone_services_t standaloneServicesExtension{
     CLAP_WRAPPER_STANDALONE_SERVICES_ABI_VERSION,
     sizeof(clap_wrapper_host_standalone_services_t),
@@ -124,7 +152,10 @@ const clap_wrapper_host_standalone_services_t standaloneServicesExtension{
     getMidiSnapshot,
     setMidiPortOpen,
     enqueueEvent,
-    getEventTelemetry};
+    getEventTelemetry,
+    enqueueTimestampedEvent,
+    dequeueOutputEvent,
+    getOutputEventTelemetry};
 
 struct VectorOutputStream
 {
@@ -329,12 +360,16 @@ void StandaloneHost::setupMIDIBusses(const clap_plugin_t *plugin,
   if (numMIDIOutPorts > 0)
   {
     createsMidiOutput = true;
-    LOGINFO("[WARNING] Midi Output not supported yet");
+    LOGINFO("[WARNING] Midi output is queued for standalone-services; no device forwarder is configured");
   }
 }
 
 void StandaloneHost::clapProcess(void *pOutput, const void *pInput, uint32_t frameCount)
 {
+  const auto now = std::chrono::steady_clock::now().time_since_epoch();
+  services.beginAudioBlock(
+      frameCount, currentSampleRate > 0 ? static_cast<uint32_t>(currentSampleRate) : 0,
+      static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now).count()));
   auto f = (float *)pOutput;
 
   if (!running.load(std::memory_order_acquire) || !isActive.load(std::memory_order_acquire))
@@ -342,6 +377,7 @@ void StandaloneHost::clapProcess(void *pOutput, const void *pInput, uint32_t fra
     if (f != nullptr && currentOutputChannels != 0)
       memset(f, 0, frameCount * currentOutputChannels * sizeof(float));
     finishedRunning = true;
+    services.endAudioBlock();
     return;
   }
 
@@ -436,6 +472,7 @@ void StandaloneHost::clapProcess(void *pOutput, const void *pInput, uint32_t fra
   // process() is the active bidirectional parameter transport.
   parameterFlushRequested.store(false, std::memory_order_release);
   clapPlugin->_plugin->process(clapPlugin->_plugin, &process);
+  services.endAudioBlock();
 
 }
 

@@ -34,6 +34,7 @@ static os_log_t _auv3Log()
 #define AUV3LOG(...) os_log(_auv3Log(), __VA_ARGS__)
 #define AUV3ERR(...) os_log_error(_auv3Log(), __VA_ARGS__)
 
+#if !defined(CLAP_WRAPPER_HAS_CHARDIO_AUV3_METADATA)
 static bool auv3NotePortsSupportMPE(const clap_plugin_t *plugin)
 {
   if (!plugin || !plugin->get_extension) return false;
@@ -51,6 +52,7 @@ static bool auv3NotePortsSupportMPE(const clap_plugin_t *plugin)
   }
   return false;
 }
+#endif
 
 bool Clap::AUv3::inputNotePortsSupportMIDI2(const clap_plugin_t *plugin,
                                              const clap_plugin_note_ports_t *notePorts)

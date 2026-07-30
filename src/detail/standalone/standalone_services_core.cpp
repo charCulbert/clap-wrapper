@@ -128,8 +128,15 @@ uint32_t StandaloneServicesCore::drainEventsForBlock(uint32_t frameCount, Ingres
   if (destination == nullptr || capacity == 0) return 0;
   uint32_t count{};
   IngressEvent event;
-  while (count < capacity && ingress.pop(event))
+  while (count < capacity &&
+         ingress.popIf(event,
+                       [this](const auto &candidate)
+                       {
+                         return candidate.timing.targetBlockSequence == 0 ||
+                                candidate.timing.targetBlockSequence <= currentAudioBlock.sequence;
+                       }))
   {
+    if (event.timing.deviceTimestamp) mapTimestampToAudioBlock(event, frameCount);
     const auto *header = reinterpret_cast<const clap_event_header_t *>(event.bytes.data());
     if (header->time >= frameCount)
     {
@@ -156,6 +163,92 @@ uint32_t StandaloneServicesCore::drainEventsForBlock(uint32_t frameCount, Ingres
     destination[j] = value;
   }
   return count;
+}
+
+void StandaloneServicesCore::mapTimestampToAudioBlock(IngressEvent &event, uint32_t frameCount) const
+{
+  auto *header = reinterpret_cast<clap_event_header_t *>(event.bytes.data());
+  if (!event.timing.phaseValid || event.timing.sourceFrameCount == 0 || frameCount == 0)
+  {
+    header->time = 0;
+    return;
+  }
+  const auto currentFrame = (static_cast<uint64_t>(event.timing.sourceFrame) * frameCount) /
+                            event.timing.sourceFrameCount;
+  header->time = static_cast<uint32_t>(std::min<uint64_t>(currentFrame, frameCount - 1));
+}
+
+IngressTiming StandaloneServicesCore::captureIngressTiming(uint64_t timestampNs,
+                                                            bool useTimestamp) const
+{
+  const auto clock = readAudioClock();
+  IngressTiming timing{};
+  timing.deviceTimestamp = useTimestamp;
+  const auto currentSequence =
+      clock.current.sequence != 0
+          ? clock.current.sequence
+          : publishedCurrentSequence.load(std::memory_order_acquire);
+  if (currentSequence != 0) timing.targetBlockSequence = currentSequence + 1;
+  if (!useTimestamp || timestampNs == 0) return timing;
+
+  const AudioBlockAnchor *source{};
+  if (clock.current.startTimeNs != 0 && timestampNs >= clock.current.startTimeNs)
+  {
+    source = &clock.current;
+  }
+  else if (clock.previous.startTimeNs != 0 &&
+           clock.current.startTimeNs > clock.previous.startTimeNs &&
+           timestampNs >= clock.previous.startTimeNs &&
+           timestampNs < clock.current.startTimeNs)
+  {
+    source = &clock.previous;
+    timing.targetBlockSequence = clock.current.sequence;
+  }
+  if (source == nullptr || source->sampleRate == 0 || source->frameCount == 0) return timing;
+
+  const auto elapsedNs = timestampNs - source->startTimeNs;
+  const auto finalFrame = static_cast<uint64_t>(source->frameCount - 1);
+  const auto finalFrameTimeNs = (finalFrame * 1000000000ull) / source->sampleRate;
+  timing.sourceFrame = static_cast<uint32_t>(
+      elapsedNs >= finalFrameTimeNs ? finalFrame
+                                   : (elapsedNs * source->sampleRate) / 1000000000ull);
+  timing.sourceFrameCount = source->frameCount;
+  timing.phaseValid = true;
+  return timing;
+}
+
+AudioClockSnapshot StandaloneServicesCore::readAudioClock() const
+{
+  for (int attempt = 0; attempt < 2; ++attempt)
+  {
+    const auto before = audioClockRevision.load(std::memory_order_acquire);
+    if ((before & 1u) != 0) continue;
+    AudioClockSnapshot result;
+    result.previous.sequence = publishedPreviousSequence.load(std::memory_order_relaxed);
+    result.previous.startTimeNs = publishedPreviousStartTimeNs.load(std::memory_order_relaxed);
+    result.previous.sampleRate = publishedPreviousSampleRate.load(std::memory_order_relaxed);
+    result.previous.frameCount = publishedPreviousFrameCount.load(std::memory_order_relaxed);
+    result.current.sequence = publishedCurrentSequence.load(std::memory_order_relaxed);
+    result.current.startTimeNs = publishedCurrentStartTimeNs.load(std::memory_order_relaxed);
+    result.current.sampleRate = publishedCurrentSampleRate.load(std::memory_order_relaxed);
+    result.current.frameCount = publishedCurrentFrameCount.load(std::memory_order_relaxed);
+    if (audioClockRevision.load(std::memory_order_acquire) == before) return result;
+  }
+  return {};
+}
+
+void StandaloneServicesCore::publishAudioClock()
+{
+  audioClockRevision.fetch_add(1, std::memory_order_acq_rel);
+  publishedPreviousSequence.store(previousAudioBlock.sequence, std::memory_order_relaxed);
+  publishedPreviousStartTimeNs.store(previousAudioBlock.startTimeNs, std::memory_order_relaxed);
+  publishedPreviousSampleRate.store(previousAudioBlock.sampleRate, std::memory_order_relaxed);
+  publishedPreviousFrameCount.store(previousAudioBlock.frameCount, std::memory_order_relaxed);
+  publishedCurrentSequence.store(currentAudioBlock.sequence, std::memory_order_relaxed);
+  publishedCurrentStartTimeNs.store(currentAudioBlock.startTimeNs, std::memory_order_relaxed);
+  publishedCurrentSampleRate.store(currentAudioBlock.sampleRate, std::memory_order_relaxed);
+  publishedCurrentFrameCount.store(currentAudioBlock.frameCount, std::memory_order_relaxed);
+  audioClockRevision.fetch_add(1, std::memory_order_release);
 }
 
 bool StandaloneServicesCore::restoreSettings(const clap_wrapper_standalone_audio_settings_t &audio,

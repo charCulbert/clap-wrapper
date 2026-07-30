@@ -325,7 +325,11 @@ bool StandaloneHost::startAudioThreadOn(unsigned int inputDeviceID, uint32_t inp
 void StandaloneHost::stopAudioThread()
 {
   LOGINFO("Shutting down audio");
-  if (!rtaDac) return;
+  if (!rtaDac)
+  {
+    services.resetAudioClock();
+    return;
+  }
 
   services.setAudioRunning(false);
 
@@ -349,6 +353,7 @@ void StandaloneHost::stopAudioThread()
       rtaDac->closeStream();
     }
   }
+  services.resetAudioClock();
   return;
 }
 }  // namespace freeaudio::clap_wrapper::standalone

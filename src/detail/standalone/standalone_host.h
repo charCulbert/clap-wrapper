@@ -54,7 +54,8 @@ struct StandaloneHost : Clap::IHost
 
   static bool oe_try_push(const struct clap_output_events *oe, const clap_event_header_t *evt)
   {
-    return true;
+    auto *sh = static_cast<StandaloneHost *>(oe->ctx);
+    return sh != nullptr && sh->services.enqueueOutputEvent(evt);
   }
 
   static uint32_t ie_getsize(const struct clap_input_events *ie)

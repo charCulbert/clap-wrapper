@@ -27,8 +27,15 @@
 #import <CoreAudioKit/CoreAudioKit.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMIDI/CoreMIDI.h>
+#include "ios_midi_out_timing.h"
 #include <atomic>
+#include <cmath>
+#include <limits>
 #include <mach/mach_time.h>
+#include <memory>
+
+static_assert(AUEventSampleTimeImmediate == Clap::Standalone::IOSMidiOut::immediateSampleTime,
+              "iOS MIDI output immediate sample-time must keep AUAudioUnit semantics");
 
 static OSType FourCCFromString(const char *s)
 {
@@ -59,21 +66,48 @@ namespace
 {
 struct MidiOutPacket
 {
-  AUEventSampleTime time;
+  MIDITimeStamp hostTime;
   uint8_t length;
   uint8_t data[3];
 };
+
+// The AU reports MIDI output in its render sample-time domain. The source
+// node gives us the matching host-time/sample-time anchor for each render
+// cycle, so convert while still on that cycle instead of guessing at drain
+// time. CoreMIDI virtual-source packets always need a nonzero host timestamp.
+static uint64_t hostTicksPerSampleQ32(double sampleRate)
+{
+  mach_timebase_info_data_t timebase{};
+  if (sampleRate <= 0 || mach_timebase_info(&timebase) != KERN_SUCCESS || timebase.numer == 0)
+    return 0;
+
+  const long double ticksPerSample =
+      (1000000000.0L * timebase.denom) / (timebase.numer * (long double)sampleRate);
+  const long double scaled = ticksPerSample * (1ULL << 32);
+  if (scaled <= 0 || scaled >= (long double)std::numeric_limits<uint64_t>::max()) return 0;
+  return (uint64_t)(scaled + 0.5L);
+}
+
 constexpr uint32_t kMidiOutRingSize = 512;
 constexpr uint32_t kMidiOutRingMask = kMidiOutRingSize - 1;
 static_assert((kMidiOutRingSize & kMidiOutRingMask) == 0, "kMidiOutRingSize must be a power of two");
+
+struct MidiOutContext
+{
+  std::atomic<uint32_t> head{0};  // reader cursor, drain side
+  std::atomic<uint32_t> tail{0};  // writer cursor, render side
+  MidiOutPacket ring[kMidiOutRingSize]{};
+  Clap::Standalone::IOSMidiOut::RenderAnchor renderAnchor;
+  MIDIEndpointRef source = 0;
+};
+
+static char midiOutDrainQueueKey;
 }  // namespace
 
 @interface IOSHostViewController : UIViewController
 {
-  // C++ ivars — std::atomic isn't expressible through @property.
-  std::atomic<uint32_t> _midiOutHead;  // reader cursor, drain side
-  std::atomic<uint32_t> _midiOutTail;  // writer cursor, render side
-  MidiOutPacket _midiOutRing[kMidiOutRingSize];
+  std::shared_ptr<MidiOutContext> _midiOutContext;
+  BOOL _renderResourcesAllocated;
 }
 @property(nonatomic, strong) AUAudioUnit *audioUnit;
 @property(nonatomic, strong) UIViewController *pluginViewController;
@@ -82,8 +116,9 @@ static_assert((kMidiOutRingSize & kMidiOutRingMask) == 0, "kMidiOutRingSize must
 @property(nonatomic, strong) NSMutableArray<AVAudioSourceNode *> *auSourceNodes;
 @property(nonatomic, assign) MIDIClientRef midiClient;
 @property(nonatomic, assign) MIDIPortRef midiInputPort;
-@property(nonatomic, assign) MIDIEndpointRef midiVirtualSource;
 @property(nonatomic, strong) dispatch_source_t midiOutDrainTimer;
+@property(nonatomic, strong) dispatch_queue_t midiOutDrainQueue;
+@property(nonatomic, strong) dispatch_group_t midiOutTeardownFence;
 @property(nonatomic, copy) AUScheduleMIDIEventBlock scheduleMIDIBlock;
 @end
 
@@ -270,9 +305,8 @@ static void IOSHostMIDIReadProc(const MIDIPacketList *pktlist, void *readProcRef
     return;
   }
 
-  // Reset ring cursors before any producer can start writing.
-  _midiOutHead.store(0, std::memory_order_relaxed);
-  _midiOutTail.store(0, std::memory_order_relaxed);
+  auto context = std::make_shared<MidiOutContext>();
+  _midiOutContext = context;
 
   NSString *displayName = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleDisplayName"];
   if (displayName.length == 0)
@@ -285,65 +319,64 @@ static void IOSHostMIDIReadProc(const MIDIPacketList *pktlist, void *readProcRef
   if (st != noErr)
   {
     NSLog(@"[ios-host] MIDISourceCreate failed: %d", (int)st);
+    _midiOutContext.reset();
     return;
   }
-  self.midiVirtualSource = src;
+  context->source = src;
 
   // Render-thread block. Writes are bounded — no allocation, no Obj-C
-  // method dispatch, no locks. Pointers (not self) are captured by value
-  // so the block doesn't trigger a weak-load on every call. Lifetime: the
-  // ring lives in the VC's ivars, which outlives the AU (we tear the AU
-  // down in dealloc/teardown before the VC goes away).
-  auto *ringPtr = _midiOutRing;
-  auto *headPtr = &_midiOutHead;
-  auto *tailPtr = &_midiOutTail;
+  // method dispatch, or locks. The captured context keeps its ring and
+  // render anchor alive until both the AU and timer callbacks are gone.
 
   self.audioUnit.MIDIOutputEventBlock =
       ^OSStatus(AUEventSampleTime sampleTime, uint8_t cable, NSInteger length, const uint8_t *data) {
         (void)cable;
         if (length <= 0 || length > 3) return noErr;
-        uint32_t tail = tailPtr->load(std::memory_order_relaxed);
-        uint32_t head = headPtr->load(std::memory_order_acquire);
+        uint32_t tail = context->tail.load(std::memory_order_relaxed);
+        uint32_t head = context->head.load(std::memory_order_acquire);
         uint32_t next = (tail + 1) & kMidiOutRingMask;
         if (next == head) return noErr;  // ring full — drop
-        MidiOutPacket &slot = ringPtr[tail];
-        slot.time = sampleTime;
+        MidiOutPacket &slot = context->ring[tail];
+        const MIDITimeStamp enqueueHostTime = mach_absolute_time();
+        slot.hostTime = Clap::Standalone::IOSMidiOut::hostTimeForSample(
+            static_cast<Clap::Standalone::IOSMidiOut::SampleTime>(sampleTime), context->renderAnchor,
+            enqueueHostTime);
         slot.length = (uint8_t)length;
         for (NSInteger i = 0; i < length && i < 3; ++i) slot.data[i] = data[i];
-        tailPtr->store(next, std::memory_order_release);
+        context->tail.store(next, std::memory_order_release);
         return noErr;
       };
 
-  // 1ms drain timer on a user-initiated background queue. MIDIReceived
-  // takes kernel locks and is not RT-safe to call from render context;
-  // the ring + timer pair keeps that work off the audio thread.
-  dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+  // A serial queue lets teardown fence any in-flight drain before it disposes
+  // the CoreMIDI source. MIDIReceived stays off the render thread.
+  dispatch_queue_t q = dispatch_queue_create("org.freeaudio.clapwrapper.midi-out", DISPATCH_QUEUE_SERIAL);
+  dispatch_queue_set_specific(q, &midiOutDrainQueueKey, &midiOutDrainQueueKey, NULL);
   dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
   dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 0), 1 * NSEC_PER_MSEC,
                             100 * NSEC_PER_USEC);
 
-  MIDIEndpointRef capturedSrc = src;
   dispatch_source_set_event_handler(timer, ^{
-    uint32_t head = headPtr->load(std::memory_order_relaxed);
-    uint32_t tail = tailPtr->load(std::memory_order_acquire);
+    uint32_t head = context->head.load(std::memory_order_relaxed);
+    uint32_t tail = context->tail.load(std::memory_order_acquire);
     while (head != tail)
     {
-      MidiOutPacket &slot = ringPtr[head];
-      // We lose the AU's per-event sampleTime fidelity here in
-      // exchange for simplicity — packets are stamped at drain time.
-      // For a synth dev host the resulting <=1ms jitter is fine; if a
-      // future use case needs sample-accurate output, wire the
-      // sampleTime through into a HostTime conversion via
-      // mach_timebase_info.
+      MidiOutPacket &slot = context->ring[head];
+      // MIDIReceived publishes packets when this timer runs. A missed target
+      // cannot be recovered retroactively, so publish it at the current host
+      // time rather than forwarding an already-past timestamp.
+      const MIDITimeStamp now = mach_absolute_time();
+      const MIDITimeStamp hostTime =
+          Clap::Standalone::IOSMidiOut::hostTimeForDrain(slot.hostTime, now);
       MIDIPacketList list;
       MIDIPacket *pkt = MIDIPacketListInit(&list);
-      pkt = MIDIPacketListAdd(&list, sizeof(list), pkt, mach_absolute_time(), slot.length, slot.data);
-      if (pkt) MIDIReceived(capturedSrc, &list);
+      pkt = MIDIPacketListAdd(&list, sizeof(list), pkt, hostTime, slot.length, slot.data);
+      if (pkt && context->source) MIDIReceived(context->source, &list);
       head = (head + 1) & kMidiOutRingMask;
     }
-    headPtr->store(head, std::memory_order_release);
+    context->head.store(head, std::memory_order_release);
   });
   self.midiOutDrainTimer = timer;
+  self.midiOutDrainQueue = q;
   dispatch_resume(timer);
 
   NSLog(@"[ios-host] MIDI-out: virtual source \"%@\" ready (%lu port(s) advertised)", sourceName,
@@ -352,24 +385,90 @@ static void IOSHostMIDIReadProc(const MIDIPacketList *pktlist, void *readProcRef
 
 - (void)tearDownMIDIOutput
 {
-  if (self.midiOutDrainTimer)
+  // Stop/deallocate render production before releasing the block that owns
+  // the context. The AU wrapper waits for an in-flight render before its
+  // process adapter is destroyed.
+  [self tearDownEngineGraph];
+
+  self.audioUnit.MIDIOutputEventBlock = nil;
+  auto context = _midiOutContext;
+  dispatch_source_t timer = self.midiOutDrainTimer;
+  dispatch_queue_t queue = self.midiOutDrainQueue;
+  if (timer)
   {
-    dispatch_source_cancel(self.midiOutDrainTimer);
+    dispatch_source_cancel(timer);
     self.midiOutDrainTimer = nil;
   }
-  if (_midiVirtualSource)
+  self.midiOutDrainQueue = nil;
+
+  const auto teardownAction = Clap::Standalone::IOSMidiOut::teardownAction(
+      queue && dispatch_get_specific(&midiOutDrainQueueKey) == &midiOutDrainQueueKey);
+  if (queue && teardownAction == Clap::Standalone::IOSMidiOut::TeardownAction::asynchronouslyFence)
   {
-    MIDIEndpointDispose(_midiVirtualSource);
-    _midiVirtualSource = 0;
+    // Reentrant teardown from MIDIReceived cannot synchronously wait on its
+    // own serial queue. The fence also keeps dealloc from disposing the
+    // owning MIDI client before this source is gone.
+    dispatch_group_t fence = self.midiOutTeardownFence;
+    if (!fence)
+    {
+      fence = dispatch_group_create();
+      self.midiOutTeardownFence = fence;
+    }
+    dispatch_group_enter(fence);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+      dispatch_sync(queue, ^{});
+      if (context && context->source)
+      {
+        MIDIEndpointDispose(context->source);
+        context->source = 0;
+      }
+      dispatch_group_leave(fence);
+    });
   }
+  else
+  {
+    if (queue) dispatch_sync(queue, ^{});
+    if (context && context->source)
+    {
+      MIDIEndpointDispose(context->source);
+      context->source = 0;
+    }
+  }
+  _midiOutContext.reset();
 }
 
 - (void)dealloc
 {
   [[NSNotificationCenter defaultCenter] removeObserver:self];
+
+  MIDIClientRef client = _midiClient;
+  MIDIPortRef inputPort = _midiInputPort;
+  _midiClient = 0;
+  _midiInputPort = 0;
   [self tearDownMIDIOutput];
-  if (_midiInputPort) MIDIPortDispose(_midiInputPort);
-  if (_midiClient) MIDIClientDispose(_midiClient);
+
+  dispatch_group_t fence = self.midiOutTeardownFence;
+  void (^disposeClient)(void) = ^{
+    if (inputPort) MIDIPortDispose(inputPort);
+    if (client) MIDIClientDispose(client);
+  };
+
+  const auto clientTeardownAction = Clap::Standalone::IOSMidiOut::teardownAction(
+      fence && dispatch_get_specific(&midiOutDrainQueueKey) == &midiOutDrainQueueKey);
+  if (fence && clientTeardownAction == Clap::Standalone::IOSMidiOut::TeardownAction::asynchronouslyFence)
+  {
+    // Waiting here would deadlock: the fence needs this event handler to
+    // return before its queued drain barrier can run.
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+      dispatch_group_wait(fence, DISPATCH_TIME_FOREVER);
+      disposeClient();
+    });
+  }
+  else
+  {
+    if (fence) dispatch_group_wait(fence, DISPATCH_TIME_FOREVER);
+    disposeClient();
+  }
 }
 
 // Audio graph setup is split into three pieces so we can rebuild the engine
@@ -445,6 +544,7 @@ static void IOSHostMIDIReadProc(const MIDIPacketList *pktlist, void *readProcRef
     NSLog(@"[ios-host] allocateRenderResources failed: %@", err);
     return;
   }
+  _renderResourcesAllocated = YES;
 
   // Use renderBlock — NOT internalRenderBlock. renderBlock is the
   // public entry that wraps the internal block with parameter
@@ -453,6 +553,8 @@ static void IOSHostMIDIReadProc(const MIDIPacketList *pktlist, void *readProcRef
   // that delivers MIDI events from scheduleMIDIEventBlock into the
   // render cycle.
   AURenderBlock auRender = self.audioUnit.renderBlock;
+  const uint64_t ticksPerSample = hostTicksPerSampleQ32(sr);
+  auto midiOutContext = _midiOutContext;
 
   self.audioEngine = [[AVAudioEngine alloc] init];
   self.auSourceNodes = [NSMutableArray arrayWithCapacity:outBusCount];
@@ -465,6 +567,13 @@ static void IOSHostMIDIReadProc(const MIDIPacketList *pktlist, void *readProcRef
         initWithFormat:auFormat
            renderBlock:^OSStatus(BOOL *isSilence, const AudioTimeStamp *timestamp,
                                  AVAudioFrameCount frameCount, AudioBufferList *outputData) {
+             if (midiOutContext)
+               Clap::Standalone::IOSMidiOut::updateRenderAnchor(
+                   midiOutContext->renderAnchor, timestamp ? timestamp->mSampleTime : 0,
+                   timestamp ? timestamp->mHostTime : 0,
+                   timestamp && (timestamp->mFlags & kAudioTimeStampSampleTimeValid) != 0,
+                   timestamp && (timestamp->mFlags & kAudioTimeStampHostTimeValid) != 0, frameCount,
+                   ticksPerSample);
              AudioUnitRenderActionFlags flags = 0;
              return auRender(&flags, timestamp, frameCount, busIndex, outputData, NULL);
            }];
@@ -478,11 +587,17 @@ static void IOSHostMIDIReadProc(const MIDIPacketList *pktlist, void *readProcRef
 
 - (void)tearDownEngineGraph
 {
+  if (_midiOutContext)
+    _midiOutContext->renderAnchor.valid.store(0, std::memory_order_release);
   if (self.audioEngine.isRunning) [self.audioEngine stop];
   for (AVAudioSourceNode *node in self.auSourceNodes) [self.audioEngine detachNode:node];
   self.auSourceNodes = nil;
   self.audioEngine = nil;
-  [self.audioUnit deallocateRenderResources];
+  if (_renderResourcesAllocated)
+  {
+    [self.audioUnit deallocateRenderResources];
+    _renderResourcesAllocated = NO;
+  }
 }
 
 // Notification observers for AVAudioSession interruption + route change and
@@ -630,7 +745,7 @@ static void IOSHostMIDIReadProc(const MIDIPacketList *pktlist, void *readProcRef
 - (void)handleAppWillTerminate:(NSNotification *)note
 {
   NSLog(@"[ios-host] app terminating — clean shutdown");
-  [self tearDownEngineGraph];
+  [self tearDownMIDIOutput];
   NSError *err = nil;
   [[AVAudioSession sharedInstance] setActive:NO
                                  withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation

@@ -59,6 +59,22 @@ bool testAbiAndNegotiation()
   static_assert(offsetof(clap_wrapper_host_standalone_services_t, enqueue_event) >
                     offsetof(clap_wrapper_host_standalone_services_t, get_midi_snapshot),
                 "extension ABI must remain append-only");
+  static_assert(offsetof(clap_wrapper_host_standalone_services_t, dequeue_output_event) >
+                    offsetof(clap_wrapper_host_standalone_services_t, get_event_telemetry),
+                "output retrieval is appended to extension ABI");
+  clap_wrapper_host_standalone_services_t extension{};
+  extension.abi_version = CLAP_WRAPPER_STANDALONE_SERVICES_ABI_VERSION;
+  extension.struct_size = offsetof(clap_wrapper_host_standalone_services_t,
+                                   enqueue_timestamped_event);
+  const bool legacyV1IsGuarded =
+      !CLAP_WRAPPER_STANDALONE_SERVICES_HAS_MEMBER(&extension, enqueue_timestamped_event) &&
+      !CLAP_WRAPPER_STANDALONE_SERVICES_HAS_MEMBER(&extension, dequeue_output_event) &&
+      !CLAP_WRAPPER_STANDALONE_SERVICES_HAS_MEMBER(&extension, get_output_event_telemetry);
+  extension.struct_size = sizeof(extension);
+  const bool appendedV1IsVisible =
+      CLAP_WRAPPER_STANDALONE_SERVICES_HAS_MEMBER(&extension, enqueue_timestamped_event) &&
+      CLAP_WRAPPER_STANDALONE_SERVICES_HAS_MEMBER(&extension, dequeue_output_event) &&
+      CLAP_WRAPPER_STANDALONE_SERVICES_HAS_MEMBER(&extension, get_output_event_telemetry);
   StandaloneServicesCore services;
   services.setAudioDevices({audioDevice(10)}, {audioDevice(20)});
   clap_wrapper_standalone_audio_snapshot_t truncated{};
@@ -78,7 +94,9 @@ bool testAbiAndNegotiation()
   negotiated.input_device_capacity = 1;
   negotiated.output_devices = &output;
   negotiated.output_device_capacity = 1;
-  return expect(rejected, "truncated snapshot ABI is rejected") &&
+  return expect(legacyV1IsGuarded && appendedV1IsVisible,
+                "appended v1 service pointers are guarded by struct_size") &&
+         expect(rejected, "truncated snapshot ABI is rejected") &&
          expect(settingsRejected, "truncated audio settings ABI is rejected") &&
          expect(needsStorage, "snapshot reports required storage without partial output") &&
          expect(services.getAudioSnapshot(negotiated) && input.id == 10 && output.id == 20,
@@ -140,6 +158,191 @@ bool testBoundedSortedDelivery()
                     telemetry.accepted_events - telemetry.consumed_events == 247 &&
                     telemetry.rejected_events >= 1,
                 "continuous producers cannot extend a callback, leave surplus queued, and reject stale events");
+}
+
+bool testTimestampedIngressAndOutput()
+{
+  StandaloneServicesCore services;
+  constexpr uint64_t blockAStartNs = 1000000000ull;
+  constexpr uint64_t blockBStartNs = blockAStartNs + 3000000ull;
+  services.beginAudioBlock(128, 48000, blockAStartNs);
+
+  const auto suppliedOffset = ramp(37, 211, 0.1);
+  const auto timestamped = ramp(0, 17, 0.2);
+  const auto tiedFirst = ramp(0, 19, 0.3);
+  const auto tiedSecond = ramp(0, 23, 0.4);
+  const auto late = ramp(99, 29, 0.5);
+  const auto noClock = ramp(99, 31, 0.6);
+  services.enqueueTimestampedEvent(&timestamped.header, sizeof(timestamped), blockAStartNs + 1000000);
+  services.enqueueTimestampedEvent(&tiedFirst.header, sizeof(tiedFirst), blockAStartNs + 2000000);
+  services.enqueueTimestampedEvent(&tiedSecond.header, sizeof(tiedSecond), blockAStartNs + 2000000);
+  services.enqueueTimestampedEvent(&late.header, sizeof(late), blockAStartNs - 1);
+  services.enqueueTimestampedEvent(&noClock.header, sizeof(noClock), 0);
+  services.enqueueEvent(&suppliedOffset.header, sizeof(suppliedOffset), 1);
+  services.endAudioBlock();
+  services.beginAudioBlock(128, 48000, blockBStartNs);
+
+  std::array<StandaloneServicesCore::IngressEvent, 6> input{};
+  const auto delivered = services.drainEventsForBlock(128, input.data(), input.size());
+  const auto *first = reinterpret_cast<const RampEvent *>(input[0].bytes.data());
+  const auto *second = reinterpret_cast<const RampEvent *>(input[1].bytes.data());
+  const auto *third = reinterpret_cast<const RampEvent *>(input[2].bytes.data());
+  const auto *fourth = reinterpret_cast<const RampEvent *>(input[3].bytes.data());
+  const auto *fifth = reinterpret_cast<const RampEvent *>(input[4].bytes.data());
+  const auto *sixth = reinterpret_cast<const RampEvent *>(input[5].bytes.data());
+
+  const auto output = ramp(91, 777, 0.9);
+  const bool outputAccepted = services.enqueueOutputEvent(&output.header);
+  std::array<unsigned char, CLAP_WRAPPER_STANDALONE_EVENT_SIZE_CAPACITY> outputBytes{};
+  clap_wrapper_standalone_output_event_info_t truncatedInfo{};
+  truncatedInfo.struct_size = offsetof(clap_wrapper_standalone_output_event_info_t,
+                                       block_sequence);
+  const bool truncatedInfoRejected =
+      !services.dequeueOutputEvent(outputBytes.data(), outputBytes.size(), truncatedInfo);
+  clap_wrapper_standalone_output_event_info_t outputInfo{};
+  outputInfo.struct_size = sizeof(outputInfo);
+  const bool outputDequeued = services.dequeueOutputEvent(outputBytes.data(), outputBytes.size(), outputInfo);
+  const auto *outputEvent = reinterpret_cast<const RampEvent *>(outputBytes.data());
+  for (uint32_t i = 0; i < StandaloneServicesCore::eventCapacity; ++i)
+    services.enqueueOutputEvent(&output.header);
+  const bool outputBackpressure = !services.enqueueOutputEvent(&output.header);
+  clap_wrapper_standalone_event_telemetry_t outputTelemetry{};
+  outputTelemetry.struct_size = sizeof(outputTelemetry);
+  services.getOutputTelemetry(outputTelemetry);
+  services.endAudioBlock();
+
+  StandaloneServicesCore changedClock;
+  constexpr uint64_t changedAStartNs = 2000000000ull;
+  changedClock.beginAudioBlock(128, 48000, changedAStartNs);
+  const auto changed = ramp(0, 41, 0.7);
+  changedClock.enqueueTimestampedEvent(&changed.header, sizeof(changed), changedAStartNs + 1000000);
+  changedClock.endAudioBlock();
+  changedClock.beginAudioBlock(64, 96000, changedAStartNs + 3000000);
+  StandaloneServicesCore::IngressEvent changedResult{};
+  const auto changedCount = changedClock.drainEventsForBlock(64, &changedResult, 1);
+  const auto *changedEvent = reinterpret_cast<const RampEvent *>(changedResult.bytes.data());
+  const auto duringChangedB = ramp(0, 43, 0.8);
+  changedClock.enqueueTimestampedEvent(&duringChangedB.header, sizeof(duringChangedB),
+                                       changedAStartNs + 3500000);
+  StandaloneServicesCore::IngressEvent prematureResult{};
+  const auto prematureCount = changedClock.drainEventsForBlock(64, &prematureResult, 1);
+  changedClock.endAudioBlock();
+  changedClock.beginAudioBlock(64, 96000, changedAStartNs + 4000000);
+  StandaloneServicesCore::IngressEvent nextResult{};
+  const auto nextCount = changedClock.drainEventsForBlock(64, &nextResult, 1);
+  const auto *nextEvent = reinterpret_cast<const RampEvent *>(nextResult.bytes.data());
+
+  return expect(delivered == input.size() && first->header.time == 0 && first->durationFrames == 31 &&
+                    second->header.time == 0 && second->durationFrames == 29 &&
+                    third->header.time == 37 && third->durationFrames == 211 &&
+                    fourth->header.time == 48 && fourth->durationFrames == 17 &&
+                    fifth->header.time == 96 && fifth->durationFrames == 19 &&
+                    sixth->header.time == 96 && sixth->durationFrames == 23,
+                "block-A device events reach block B at phase; late/no-clock events use frame zero") &&
+         expect(changedCount == 1 && changedEvent->header.time == 24 &&
+                    changedEvent->durationFrames == 41 && prematureCount == 0 &&
+                    nextCount == 1 && nextEvent->header.time == 48 &&
+                    nextEvent->durationFrames == 43,
+                "clock changes rescale phase and callback-boundary ingress waits one block") &&
+         expect(outputAccepted && truncatedInfoRejected && outputDequeued &&
+                    outputInfo.event_size == sizeof(output) &&
+                    outputEvent->header.time == 91 && outputEvent->durationFrames == 777 &&
+                    outputInfo.flags == CLAP_WRAPPER_STANDALONE_OUTPUT_EVENT_HAS_BLOCK_CONTEXT &&
+                    outputInfo.block_sequence == 2 && outputInfo.block_start_time_ns == blockBStartNs &&
+                    outputInfo.sample_rate == 48000 && outputInfo.frame_count == 128,
+                "output event preserves timestamp with schedulable block identity") &&
+         expect(outputBackpressure && outputTelemetry.accepted_events == 257 &&
+                    outputTelemetry.consumed_events == 1 && outputTelemetry.dropped_events == 1,
+                "output event telemetry exposes acceptance and backpressure");
+}
+
+bool testDelayedPublicationAcrossBlockBoundary()
+{
+  StandaloneServicesCore services;
+  constexpr uint64_t blockAStartNs = 3000000000ull;
+  constexpr uint64_t blockBStartNs = blockAStartNs + 3000000ull;
+  constexpr uint64_t blockCStartNs = blockBStartNs + 3000000ull;
+  services.beginAudioBlock(128, 48000, blockAStartNs);
+
+  const auto delayed = ramp(0, 51, 0.1);
+  std::atomic_bool reserved{false};
+  std::atomic_bool allowPublish{false};
+  bool delayedAccepted{};
+  std::thread producer(
+      [&]
+      {
+        delayedAccepted = services.enqueueTimestampedEventWithPublishHook(
+            &delayed.header, sizeof(delayed), blockAStartNs + 1000000,
+            [&]
+            {
+              reserved.store(true, std::memory_order_release);
+              while (!allowPublish.load(std::memory_order_acquire)) std::this_thread::yield();
+            });
+      });
+  while (!reserved.load(std::memory_order_acquire)) std::this_thread::yield();
+
+  services.endAudioBlock();
+  services.beginAudioBlock(128, 48000, blockBStartNs);
+  const auto behindHead = ramp(0, 53, 0.2);
+  const bool behindAccepted = services.enqueueTimestampedEvent(
+      &behindHead.header, sizeof(behindHead), blockBStartNs + 1000000);
+  std::array<StandaloneServicesCore::IngressEvent, 2> blockB{};
+  const auto blockBCount = services.drainEventsForBlock(128, blockB.data(), blockB.size());
+
+  allowPublish.store(true, std::memory_order_release);
+  producer.join();
+  services.endAudioBlock();
+  services.beginAudioBlock(128, 48000, blockCStartNs);
+  std::array<StandaloneServicesCore::IngressEvent, 2> blockC{};
+  const auto blockCCount = services.drainEventsForBlock(128, blockC.data(), blockC.size());
+  const auto *first = reinterpret_cast<const RampEvent *>(blockC[0].bytes.data());
+  const auto *second = reinterpret_cast<const RampEvent *>(blockC[1].bytes.data());
+
+  return expect(delayedAccepted && behindAccepted && blockBCount == 0,
+                "stalled head reservation makes the bounded FIFO consumer return immediately") &&
+         expect(blockCCount == 2 && first->header.time == 48 && first->durationFrames == 51 &&
+                    blockC[0].timing.targetBlockSequence == 2 &&
+                    second->header.time == 48 && second->durationFrames == 53 &&
+                    blockC[1].timing.targetBlockSequence == 3,
+                "first later eligible block preserves phase and original target-block identity");
+}
+
+bool testConcurrentOutputQueue()
+{
+  OutputEventQueue<64, 64> output;
+  constexpr uint32_t eventCount = 1024;
+  std::atomic_bool start{false};
+  std::thread producer(
+      [&]
+      {
+        while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+        for (uint32_t i = 0; i < eventCount; ++i)
+        {
+          const auto event = ramp(i, i + 1, i);
+          clap_wrapper_standalone_output_event_info_t info{};
+          info.struct_size = sizeof(info);
+          info.event_size = sizeof(event);
+          while (!output.push(&event.header, info)) std::this_thread::yield();
+        }
+      });
+
+  start.store(true, std::memory_order_release);
+  bool ordered{true};
+  for (uint32_t i = 0; i < eventCount; ++i)
+  {
+    OutputEventQueue<64, 64>::Event event;
+    while (!output.pop(event)) std::this_thread::yield();
+    const auto *rampEvent = reinterpret_cast<const RampEvent *>(event.bytes.data());
+    ordered &= rampEvent->header.time == i && rampEvent->durationFrames == i + 1;
+  }
+  producer.join();
+
+  clap_wrapper_standalone_event_telemetry_t telemetry{};
+  telemetry.struct_size = sizeof(telemetry);
+  output.getTelemetry(telemetry);
+  return expect(ordered && telemetry.accepted_events == eventCount &&
+                    telemetry.consumed_events == eventCount && telemetry.rejected_events == 0,
+                "bounded SPSC output push preserves order under concurrent consumption");
 }
 
 bool testEnvelopeAndRollback()
@@ -326,7 +529,9 @@ bool testMidiRollbackState()
 int main()
 {
   return testAbiAndNegotiation() && testIngressOrderCapacityAndRamp() && testBoundedSortedDelivery() &&
-                 testEnvelopeAndRollback() && testConcurrentIngress() && testThreadAndLifecycleGating()
+                 testTimestampedIngressAndOutput() && testDelayedPublicationAcrossBlockBoundary() &&
+                 testConcurrentOutputQueue() && testEnvelopeAndRollback() &&
+                 testConcurrentIngress() && testThreadAndLifecycleGating()
                  && testMonoInputRoute() && testMidiEndpointBindingSeam() && testMidiRollbackState()
              ? 0
              : 1;

@@ -143,9 +143,9 @@ class MIDIOutput
   {
     return _midiPacketList;
   }
-  bool addNoteOn(uint8_t channel, uint8_t note, uint8_t velocity);
-  bool addNoteOff(uint8_t channel, uint8_t note, uint8_t velocity);
-  bool addMIDI3Byte(const uint8_t *threebytes);
+  bool addNoteOn(uint8_t channel, uint8_t note, uint8_t velocity, uint32_t sampleOffset);
+  bool addNoteOff(uint8_t channel, uint8_t note, uint8_t velocity, uint32_t sampleOffset);
+  bool addMIDI3Byte(const uint8_t *threebytes, uint32_t sampleOffset);
 
   void clear();
   const clap_note_port_info _info;
@@ -175,26 +175,39 @@ void MIDIOutput::clear()
   _numEvents = 0;
 }
 
-bool MIDIOutput::addNoteOn(uint8_t channel, uint8_t note, uint8_t velocity)
+bool MIDIOutput::addNoteOn(uint8_t channel, uint8_t note, uint8_t velocity, uint32_t sampleOffset)
 {
   uint8_t ev[3] = {static_cast<uint8_t>((uint8_t)0x90u | (channel & 0xF)),
                    static_cast<uint8_t>((note & 0x7F)), static_cast<uint8_t>((velocity & 0x7F))};
-  _current = MIDIPacketListAdd(_midiPacketList, sizeof(_buffer), _current, 0, 3, (Byte *)ev);
+  if (_current == nullptr) return false;
+
+  auto *next = MIDIPacketListAdd(_midiPacketList, sizeof(_buffer), _current, sampleOffset, 3, ev);
+  if (next == nullptr) return false;
+
+  _current = next;
   ++_numEvents;
-  return (_current != nullptr);
+  return true;
 }
-bool MIDIOutput::addNoteOff(uint8_t channel, uint8_t note, uint8_t velocity)
+bool MIDIOutput::addNoteOff(uint8_t channel, uint8_t note, uint8_t velocity, uint32_t sampleOffset)
 {
   uint8_t ev[3] = {static_cast<uint8_t>((uint8_t)0x80u | (channel & 0xF)),
                    static_cast<uint8_t>((note & 0x7F)), static_cast<uint8_t>((velocity & 0x7F))};
-  _current = MIDIPacketListAdd(_midiPacketList, sizeof(_buffer), _current, 0, 3, (Byte *)ev);
+  if (_current == nullptr) return false;
+
+  auto *next = MIDIPacketListAdd(_midiPacketList, sizeof(_buffer), _current, sampleOffset, 3, ev);
+  if (next == nullptr) return false;
+
+  _current = next;
   ++_numEvents;
-  return (_current != nullptr);
+  return true;
 }
 
-bool MIDIOutput::addMIDI3Byte(const uint8_t *threebytes)
+bool MIDIOutput::addMIDI3Byte(const uint8_t *threebytes, uint32_t sampleOffset)
 {
+  if (_current == nullptr) return false;
+
   auto cmd = (threebytes[0] >> 4) & 0xFu;
+  MIDIPacket *next = nullptr;
   switch (cmd)
   {
     case 0x08:
@@ -202,18 +215,21 @@ bool MIDIOutput::addMIDI3Byte(const uint8_t *threebytes)
     case 0x0A:
     case 0x0B:
     case 0x0E:
-      _current = MIDIPacketListAdd(_midiPacketList, sizeof(_buffer), _current, 0, 3, threebytes);
+      next = MIDIPacketListAdd(_midiPacketList, sizeof(_buffer), _current, sampleOffset, 3, threebytes);
       break;
     case 0x0C:
     case 0x0D:
-      _current = MIDIPacketListAdd(_midiPacketList, sizeof(_buffer), _current, 0, 2, threebytes);
+      next = MIDIPacketListAdd(_midiPacketList, sizeof(_buffer), _current, sampleOffset, 2, threebytes);
       break;
     default:
       return false;
   }
 
+  if (next == nullptr) return false;
+
+  _current = next;
   ++_numEvents;
-  return (_current != nullptr);
+  return true;
 }
 
 class WrapAsAUV2 : public ausdk::AUBase,

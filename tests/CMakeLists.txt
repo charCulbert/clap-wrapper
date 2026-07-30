@@ -24,8 +24,56 @@ target_compile_features(standalone-services-tests PRIVATE cxx_std_17)
 target_link_libraries(standalone-services-tests PRIVATE Threads::Threads)
 add_test(NAME standalone-services COMMAND standalone-services-tests)
 
+if (TARGET base-sdk-vst3)
+    add_executable(vst3-process-timing-tests
+        vst3-process-timing-tests.cpp
+        ../src/detail/vst3/process.cpp
+        ../src/detail/vst3/parameter.cpp
+        ${VST3_SDK_ROOT}/public.sdk/source/vst/hosting/eventlist.cpp
+        ${VST3_SDK_ROOT}/public.sdk/source/vst/hosting/parameterchanges.cpp
+    )
+    target_include_directories(vst3-process-timing-tests PRIVATE
+        ../src
+        ../include
+        ${CLAP_SDK_ROOT}/include
+    )
+    target_compile_features(vst3-process-timing-tests PRIVATE cxx_std_17)
+    target_link_libraries(vst3-process-timing-tests PRIVATE
+        clap
+        base-sdk-vst3
+        clap-wrapper-compile-options
+    )
+    if (APPLE)
+        target_link_libraries(vst3-process-timing-tests PRIVATE "-framework CoreFoundation")
+    endif()
+    add_test(NAME vst3-process-timing COMMAND vst3-process-timing-tests)
+endif()
+
 if (APPLE)
     add_subdirectory(clap-macos-embedded)
+
+    if (TARGET base-sdk-auv2)
+        add_executable(auv2-midi-output-timing-tests auv2-midi-output-timing-tests.cpp)
+        target_include_directories(auv2-midi-output-timing-tests PRIVATE
+            ../src
+            ../include
+            ${CLAP_SDK_ROOT}/include
+        )
+        target_compile_features(auv2-midi-output-timing-tests PRIVATE cxx_std_17)
+        target_link_libraries(auv2-midi-output-timing-tests PRIVATE
+            clap
+            base-sdk-auv2
+            clap-wrapper-shared-detail
+            clap-wrapper-compile-options
+            "-framework AudioToolbox"
+            "-framework CoreMIDI"
+        )
+        add_test(NAME auv2-midi-output-timing COMMAND auv2-midi-output-timing-tests)
+    endif()
+
+    add_executable(ios-auv3-midi-output-timing-tests ios-auv3-midi-output-timing-tests.cpp)
+    target_compile_features(ios-auv3-midi-output-timing-tests PRIVATE cxx_std_17)
+    add_test(NAME ios-auv3-midi-output-timing COMMAND ios-auv3-midi-output-timing-tests)
 
     add_executable(auv3-process-tests
         auv3-process-tests.mm

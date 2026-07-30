@@ -1,6 +1,8 @@
 #include "standalone_host.h"
 #include "standalone_details.h"
 
+#include <chrono>
+
 #ifdef __GNUC__
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wall"  // other peoples errors are outside my scope
@@ -79,8 +81,9 @@ void StandaloneHost::processMIDIEvents(double deltatime, std::vector<unsigned ch
     event.port_index = 0;
     std::memcpy(event.data, message->data(), nBytes);
     const auto now = std::chrono::steady_clock::now().time_since_epoch();
-    services.enqueueEvent(&event.header, event.header.size,
-                          static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now).count()));
+    services.enqueueTimestampedEvent(
+        &event.header, event.header.size,
+        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now).count()));
   }
 }
 
