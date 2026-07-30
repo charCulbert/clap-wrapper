@@ -17,20 +17,37 @@ if (APPLE)
         auv3-process-tests.mm
         ../src/detail/auv3/process.mm
     )
+    add_executable(auv3-parameter-metadata-tests
+        auv3-parameter-metadata-tests.mm
+        ../src/detail/auv3/auv3_parameters.mm
+    )
     target_include_directories(auv3-process-tests PRIVATE
         ..
         ../src
         ../include
         ${CLAP_SDK_ROOT}/include
     )
+    target_include_directories(auv3-parameter-metadata-tests PRIVATE
+        ..
+        ../src
+        ../include
+        ${CLAP_SDK_ROOT}/include
+    )
     target_compile_features(auv3-process-tests PRIVATE cxx_std_17)
+    target_compile_features(auv3-parameter-metadata-tests PRIVATE cxx_std_17)
     target_compile_options(auv3-process-tests PRIVATE -fblocks)
+    target_compile_options(auv3-parameter-metadata-tests PRIVATE -fblocks)
     target_link_libraries(auv3-process-tests PRIVATE
         "-framework AudioToolbox"
         "-framework AVFoundation"
         "-framework Foundation"
     )
+    target_link_libraries(auv3-parameter-metadata-tests PRIVATE
+        "-framework AudioToolbox"
+        "-framework Foundation"
+    )
     add_test(NAME auv3-process COMMAND auv3-process-tests)
+    add_test(NAME auv3-parameter-metadata COMMAND auv3-parameter-metadata-tests)
 endif()
 
 add_test(

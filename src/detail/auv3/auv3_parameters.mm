@@ -6,12 +6,106 @@
 #import <AudioToolbox/AudioToolbox.h>
 #import <Foundation/Foundation.h>
 
+#include <clapwrapper/chardio-auv3-metadata.h>
+
+#include <cstddef>
 #include <string>
 #include <vector>
 #include <map>
 
 namespace Clap::AUv3
 {
+static bool hasField(uint32_t structSize, size_t fieldEnd)
+{
+  return structSize >= fieldEnd;
+}
+
+static const chardio_plugin_auv3_metadata_t *findChardioMetadata(const clap_plugin_t *plugin)
+{
+  if (!plugin || !plugin->get_extension) return nullptr;
+
+  const auto *metadata = static_cast<const chardio_plugin_auv3_metadata_t *>(
+      plugin->get_extension(plugin, CHARDIO_PLUGIN_EXT_AUV3_METADATA));
+  if (!metadata ||
+      !hasField(metadata->struct_size,
+                offsetof(chardio_plugin_auv3_metadata_t, version) + sizeof(metadata->version)) ||
+      metadata->version != CHARDIO_PLUGIN_AUV3_METADATA_VERSION ||
+      !hasField(metadata->struct_size, offsetof(chardio_plugin_auv3_metadata_t, get_parameter_metadata) +
+                                           sizeof(metadata->get_parameter_metadata)) ||
+      !metadata->get_parameter_metadata)
+    return nullptr;
+
+  return metadata;
+}
+
+struct ParameterMetadata
+{
+  NSString *identifier = nil;
+  AudioUnitParameterUnit unit = kAudioUnitParameterUnit_Generic;
+  NSString *unitName = nil;
+  NSArray<NSString *> *valueStrings = nil;
+};
+
+static NSString *createAUParameterIdentifier(const char *identifier)
+{
+  if (!identifier) return nil;
+
+  auto *result = [NSString stringWithUTF8String:identifier];
+  if (result.length == 0 || [result rangeOfString:@"."].location != NSNotFound) return nil;
+  return result;
+}
+
+static ParameterMetadata getParameterMetadata(const clap_plugin_t *plugin,
+                                              const chardio_plugin_auv3_metadata_t *extension,
+                                              clap_id parameterId, ParameterMetadata fallback)
+{
+  if (!extension) return fallback;
+
+  chardio_auv3_parameter_metadata_t metadata{};
+  metadata.struct_size = sizeof(metadata);
+  if (!extension->get_parameter_metadata(plugin, parameterId, &metadata, sizeof(metadata)))
+    return fallback;
+
+  if (hasField(metadata.struct_size,
+               offsetof(chardio_auv3_parameter_metadata_t, identifier) + sizeof(metadata.identifier)) &&
+      metadata.identifier)
+  {
+    if (auto *identifier = createAUParameterIdentifier(metadata.identifier))
+      fallback.identifier = identifier;
+  }
+
+  if (hasField(metadata.struct_size,
+               offsetof(chardio_auv3_parameter_metadata_t, unit) + sizeof(metadata.unit)))
+    fallback.unit = static_cast<AudioUnitParameterUnit>(metadata.unit);
+
+  if (hasField(metadata.struct_size,
+               offsetof(chardio_auv3_parameter_metadata_t, unit_name) + sizeof(metadata.unit_name)) &&
+      metadata.unit_name)
+  {
+    if (auto *unitName = [NSString stringWithUTF8String:metadata.unit_name])
+      fallback.unitName = unitName;
+  }
+
+  if (hasField(metadata.struct_size, offsetof(chardio_auv3_parameter_metadata_t, value_strings) +
+                                         sizeof(metadata.value_strings)) &&
+      hasField(metadata.struct_size, offsetof(chardio_auv3_parameter_metadata_t, value_string_count) +
+                                         sizeof(metadata.value_string_count)) &&
+      metadata.value_strings)
+  {
+    NSMutableArray<NSString *> *valueStrings = [NSMutableArray new];
+    for (uint32_t index = 0; index < metadata.value_string_count; ++index)
+    {
+      const auto *valueString = metadata.value_strings[index];
+      if (!valueString) return fallback;
+      auto *value = [NSString stringWithUTF8String:valueString];
+      if (!value) return fallback;
+      [valueStrings addObject:value];
+    }
+    fallback.valueStrings = valueStrings;
+  }
+
+  return fallback;
+}
 
 // Split a module path like "Filter/Cutoff" into ["Filter", "Cutoff"]
 static std::vector<std::string> splitModulePath(const char *module)
@@ -77,6 +171,7 @@ ParameterTreeResult createParameterTree(const clap_plugin_t *plugin, const clap_
     };
 
   clap_id bypassParamId = CLAP_INVALID_ID;
+  const auto *metadataExtension = findChardioMetadata(plugin);
 
   // Root group node for building hierarchy
   GroupNode root;
@@ -123,18 +218,21 @@ ParameterTreeResult createParameterTree(const clap_plugin_t *plugin, const clap_
       }
     }
 
-    NSString *identifier = [NSString stringWithFormat:@"clap_%llu", (unsigned long long)info.id];
+    ParameterMetadata parameterMetadata;
+    parameterMetadata.identifier = [NSString stringWithFormat:@"clap_%llu", (unsigned long long)info.id];
+    parameterMetadata.unit = unit;
+    parameterMetadata = getParameterMetadata(plugin, metadataExtension, info.id, parameterMetadata);
     NSString *displayName = [NSString stringWithUTF8String:info.name];
 
-    AUParameter *param = [AUParameterTree createParameterWithIdentifier:identifier
+    AUParameter *param = [AUParameterTree createParameterWithIdentifier:parameterMetadata.identifier
                                                                    name:displayName
                                                                 address:(AUParameterAddress)info.id
                                                                     min:(AUValue)info.min_value
                                                                     max:(AUValue)info.max_value
-                                                                   unit:unit
-                                                               unitName:nil
+                                                                   unit:parameterMetadata.unit
+                                                               unitName:parameterMetadata.unitName
                                                                   flags:flags
-                                                           valueStrings:nil
+                                                           valueStrings:parameterMetadata.valueStrings
                                                     dependentParameters:nil];
     param.value = (AUValue)info.default_value;
 
