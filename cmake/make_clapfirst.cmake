@@ -45,6 +45,8 @@ function(make_clapfirst_plugins)
             RESOURCE_DIRECTORY # Entire directory to be copied into a bundle/folder's resources
 
             AUV3_BUILD_STANDALONE # TRUE (default) to add the macOS AUv3 host app, FALSE for the appex only
+            AUV3_FACTORY_SOURCE  # product-owned ObjC++ or Swift AUAudioUnitFactory / AUViewController source
+            AUV3_FACTORY_CLASS   # Objective-C name exported by AUV3_FACTORY_SOURCE; Swift uses @objc(name)
 
             AUV2_MANUFACTURER_NAME # The AUV2 info. If absent we will probe the CLAP for the
             AUV2_MANUFACTURER_CODE # auv2 extension
@@ -240,6 +242,13 @@ function(make_clapfirst_plugins)
 
     if (APPLE AND ${BUILD_AUV3} GREATER -1)
         message(STATUS "clap-wrapper: ClapFirst is making an AUv3")
+        set(_auv3_factory_arguments)
+        if (DEFINED C1ST_AUV3_FACTORY_SOURCE)
+            list(APPEND _auv3_factory_arguments FACTORY_SOURCE "${C1ST_AUV3_FACTORY_SOURCE}")
+        endif()
+        if (DEFINED C1ST_AUV3_FACTORY_CLASS)
+            list(APPEND _auv3_factory_arguments FACTORY_CLASS "${C1ST_AUV3_FACTORY_CLASS}")
+        endif()
         set(AUV3_TARGET ${C1ST_TARGET_NAME}_auv3)
         add_executable(${AUV3_TARGET})
         target_sources(${AUV3_TARGET} PRIVATE ${C1ST_ENTRY_SOURCE})
@@ -255,6 +264,7 @@ function(make_clapfirst_plugins)
                     BUNDLE_IDENTIFIER "${C1ST_BUNDLE_IDENTIFIER}.auv3"
                     BUNDLE_VERSION "${C1ST_BUNDLE_VERSION}"
                     RESOURCE_DIRECTORY "${C1ST_RESOURCE_DIRECTORY}"
+                    ${_auv3_factory_arguments}
 
                     MANUFACTURER_NAME "${C1ST_AUV2_MANUFACTURER_NAME}"
                     MANUFACTURER_CODE "${C1ST_AUV2_MANUFACTURER_CODE}"
@@ -268,6 +278,7 @@ function(make_clapfirst_plugins)
                     BUNDLE_IDENTIFIER "${C1ST_BUNDLE_IDENTIFIER}.auv3"
                     BUNDLE_VERSION "${C1ST_BUNDLE_VERSION}"
                     RESOURCE_DIRECTORY "${C1ST_RESOURCE_DIRECTORY}"
+                    ${_auv3_factory_arguments}
 
                     CLAP_TARGET_FOR_CONFIG "${CLAP_TARGET}"
             )

@@ -208,13 +208,21 @@ function(target_add_auv3_standalone_ios_wrapper)
     target_link_libraries(${AUSAIOS_TARGET} PRIVATE
             ${AUSAIOS_AUV3_TARGET}-clap-wrapper-auv3-lib)
 
-    # Reproduce wrap_auv3.cmake's factory-class-name hash so the host can
-    # NSClassFromString() the same symbol the appex exports. MD5 of
-    # manufacturer+subtype, first 8 chars, uppercased.
-    string(MD5 _host_auv3_md5_full "${AUSAIOS_AU_MANUFACTURER}${AUSAIOS_AU_SUBTYPE}")
-    string(SUBSTRING "${_host_auv3_md5_full}" 0 8 _host_auv3_md5_short)
-    string(TOUPPER "${_host_auv3_md5_short}" _host_auv3_md5_short)
-    set(_host_factory_class "ClapAUv3VC_${_host_auv3_md5_short}")
+    get_property(_host_factory_class TARGET ${AUSAIOS_AUV3_TARGET}
+            PROPERTY CLAP_WRAPPER_AUV3_FACTORY_CLASS)
+    get_property(_host_factory_source TARGET ${AUSAIOS_AUV3_TARGET}
+            PROPERTY CLAP_WRAPPER_AUV3_FACTORY_SOURCE)
+    if (_host_factory_source)
+        target_sources(${AUSAIOS_TARGET} PRIVATE "${_host_factory_source}")
+    endif()
+    if (NOT _host_factory_class)
+        # Reproduce wrap_auv3.cmake's factory-class-name hash so the host can
+        # NSClassFromString() the same symbol the appex exports.
+        string(MD5 _host_auv3_md5_full "${AUSAIOS_AU_MANUFACTURER}${AUSAIOS_AU_SUBTYPE}")
+        string(SUBSTRING "${_host_auv3_md5_full}" 0 8 _host_auv3_md5_short)
+        string(TOUPPER "${_host_auv3_md5_short}" _host_auv3_md5_short)
+        set(_host_factory_class "ClapAUv3VC_${_host_auv3_md5_short}")
+    endif()
 
     target_compile_definitions(${AUSAIOS_TARGET} PRIVATE
             STATICALLY_LINKED_CLAP_ENTRY=1

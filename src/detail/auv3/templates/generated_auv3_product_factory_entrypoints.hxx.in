@@ -1,0 +1,4 @@
+#pragma once
+
+// Product supplies @AUV3_FACTORY_CLASS@ from FACTORY_SOURCE.
+// Swift factories export this bare runtime name with @objc(@AUV3_FACTORY_CLASS@).

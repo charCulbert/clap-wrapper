@@ -14,12 +14,45 @@ function(target_add_auv3_wrapper)
 
             CLAP_TARGET_FOR_CONFIG
 
+            FACTORY_SOURCE # ObjC++ or Swift factory source; Swift requires an enabled Swift language
+            FACTORY_CLASS  # Objective-C runtime name; Swift factories use @objc(FACTORY_CLASS)
+
             ENTITLEMENTS  # optional: per-plugin entitlements file (macOS appex signing)
 
             MACOS_EMBEDDED_CLAP_LOCATION
             MACOSX_EMBEDDED_CLAP_LOCATION
             )
     cmake_parse_arguments(AUV3 "" "${oneValueArgs}" "" ${ARGN})
+
+    if ("FACTORY_SOURCE" IN_LIST AUV3_KEYWORDS_MISSING_VALUES)
+        message(FATAL_ERROR "clap-wrapper: FACTORY_SOURCE requires a source path")
+    endif()
+    if ("FACTORY_CLASS" IN_LIST AUV3_KEYWORDS_MISSING_VALUES)
+        message(FATAL_ERROR "clap-wrapper: FACTORY_CLASS requires an Objective-C runtime name")
+    endif()
+    if (DEFINED AUV3_FACTORY_SOURCE AND NOT DEFINED AUV3_FACTORY_CLASS)
+        message(FATAL_ERROR "clap-wrapper: FACTORY_SOURCE requires FACTORY_CLASS")
+    endif()
+    if (DEFINED AUV3_FACTORY_CLASS AND NOT DEFINED AUV3_FACTORY_SOURCE)
+        message(FATAL_ERROR "clap-wrapper: FACTORY_CLASS requires FACTORY_SOURCE")
+    endif()
+    if (DEFINED AUV3_FACTORY_SOURCE)
+        get_filename_component(AUV3_FACTORY_SOURCE "${AUV3_FACTORY_SOURCE}" ABSOLUTE
+                BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+        if (NOT EXISTS "${AUV3_FACTORY_SOURCE}")
+            message(FATAL_ERROR "clap-wrapper: AUv3 FACTORY_SOURCE does not exist: ${AUV3_FACTORY_SOURCE}")
+        endif()
+        if (AUV3_FACTORY_SOURCE MATCHES "\\.swift$")
+            if (NOT CMAKE_Swift_COMPILER)
+                message(FATAL_ERROR
+                        "clap-wrapper: Swift FACTORY_SOURCE requires project(... LANGUAGES Swift); "
+                        "export FACTORY_CLASS with @objc(FACTORY_CLASS)")
+            endif()
+        endif()
+    endif()
+    if (DEFINED AUV3_FACTORY_CLASS AND NOT AUV3_FACTORY_CLASS MATCHES "^[A-Za-z_][A-Za-z0-9_]*$")
+        message(FATAL_ERROR "clap-wrapper: AUv3 FACTORY_CLASS must be an Objective-C class identifier")
+    endif()
 
     if (NOT DEFINED AUV3_MACOS_EMBEDDED_CLAP_LOCATION AND DEFINED AUV3_MACOSX_EMBEDDED_CLAP_LOCATION)
         set(AUV3_MACOS_EMBEDDED_CLAP_LOCATION ${AUV3_MACOSX_EMBEDDED_CLAP_LOCATION})
@@ -129,6 +162,9 @@ function(target_add_auv3_wrapper)
         string(SUBSTRING "${_csd_md5_full}" 0 8 _csd_md5_short)
         string(TOUPPER "${_csd_md5_short}" _csd_md5_short)
         set(AUV3_FACTORY_CLASS_NAME "ClapAUv3VC_${_csd_md5_short}")
+        if (DEFINED AUV3_FACTORY_CLASS)
+            set(AUV3_FACTORY_CLASS_NAME "${AUV3_FACTORY_CLASS}")
+        endif()
 
         # Pack dotted version into uint32 (matches bundleversToVersion,
         # including the per-byte clamp so the packing stays ordered when a
@@ -188,10 +224,17 @@ function(target_add_auv3_wrapper)
             "${CLAP_WRAPPER_CMAKE_CURRENT_SOURCE_DIR}/src/detail/auv3/templates/auv3_ios_Info.plist.in"
             "${bhtgoutdir}/auv3_Info.plist"
             @ONLY)
-        configure_file(
-            "${CLAP_WRAPPER_CMAKE_CURRENT_SOURCE_DIR}/src/detail/auv3/templates/generated_auv3_entrypoints.hxx.in"
-            "${bhtgoutdir}/generated_auv3_entrypoints.hxx"
-            @ONLY)
+        if (DEFINED AUV3_FACTORY_SOURCE)
+            configure_file(
+                "${CLAP_WRAPPER_CMAKE_CURRENT_SOURCE_DIR}/src/detail/auv3/templates/generated_auv3_product_factory_entrypoints.hxx.in"
+                "${bhtgoutdir}/generated_auv3_entrypoints.hxx"
+                @ONLY)
+        else()
+            configure_file(
+                "${CLAP_WRAPPER_CMAKE_CURRENT_SOURCE_DIR}/src/detail/auv3/templates/generated_auv3_entrypoints.hxx.in"
+                "${bhtgoutdir}/generated_auv3_entrypoints.hxx"
+                @ONLY)
+        endif()
     endif()
 
     # The three dispatch branches below schedule the build-helper to emit
@@ -233,6 +276,7 @@ function(target_add_auv3_wrapper)
                 "$<TARGET_FILE:${clpt}>" "${AUV3_BUNDLE_VERSION}"
                 "${AUV3_MANUFACTURER_CODE}" "${AUV3_MANUFACTURER_NAME}"
                 "${AUV3_INSTRUMENT_TYPE}" "${AUV3_SUBTYPE_CODE}"
+                $<$<BOOL:${AUV3_FACTORY_CLASS}>:--factory-class> $<$<BOOL:${AUV3_FACTORY_CLASS}>:${AUV3_FACTORY_CLASS}>
         )
     elseif (DEFINED AUV3_MACOSX_EMBEDDED_CLAP_LOCATION)
         message(STATUS "clap-wrapper: building auv3 based on clap ${AUV3_MACOSX_EMBEDDED_CLAP_LOCATION}")
@@ -261,6 +305,7 @@ function(target_add_auv3_wrapper)
                 "${AUV3_MACOSX_EMBEDDED_CLAP_LOCATION}" "${AUV3_BUNDLE_VERSION}"
                 "${AUV3_MANUFACTURER_CODE}" "${AUV3_MANUFACTURER_NAME}"
                 "${AUV3_INSTRUMENT_TYPE}" "${AUV3_SUBTYPE_CODE}"
+                $<$<BOOL:${AUV3_FACTORY_CLASS}>:--factory-class> $<$<BOOL:${AUV3_FACTORY_CLASS}>:${AUV3_FACTORY_CLASS}>
         )
     else ()
         message(STATUS "clap-wrapper: using cmake configuration for auv3")
@@ -295,6 +340,7 @@ function(target_add_auv3_wrapper)
                 "${AUV3_OUTPUT_NAME}" "${AUV3_BUNDLE_VERSION}"
                 "${AUV3_INSTRUMENT_TYPE}" "${AUV3_SUBTYPE_CODE}"
                 "${AUV3_MANUFACTURER_CODE}" "${AUV3_MANUFACTURER_NAME}"
+                $<$<BOOL:${AUV3_FACTORY_CLASS}>:--factory-class> $<$<BOOL:${AUV3_FACTORY_CLASS}>:${AUV3_FACTORY_CLASS}>
         )
     endif ()
 
@@ -327,6 +373,9 @@ function(target_add_auv3_wrapper)
             ${CLAP_WRAPPER_CMAKE_CURRENT_SOURCE_DIR}/src/detail/auv3/auv3_parameters.mm
             ${CLAP_WRAPPER_CMAKE_CURRENT_SOURCE_DIR}/src/detail/auv3/process.mm
             ${bhtgoutdir}/generated_auv3_entrypoints.hxx)
+    if (DEFINED AUV3_FACTORY_SOURCE)
+        target_sources(${AUV3_TARGET} PRIVATE "${AUV3_FACTORY_SOURCE}")
+    endif()
     target_compile_options(${AUV3_TARGET} PRIVATE -fno-char8_t -fobjc-arc)
 
     if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
@@ -351,6 +400,12 @@ function(target_add_auv3_wrapper)
     set_target_properties(${AUV3_TARGET} PROPERTIES
             OUTPUT_NAME "${AUV3_OUTPUT_NAME}"
             LIBRARY_OUTPUT_NAME "${AUV3_OUTPUT_NAME}")  # also set for target_copy_after_build compatibility
+    if (DEFINED AUV3_FACTORY_CLASS)
+        set_property(TARGET ${AUV3_TARGET} PROPERTY CLAP_WRAPPER_AUV3_FACTORY_CLASS "${AUV3_FACTORY_CLASS}")
+    endif()
+    if (DEFINED AUV3_FACTORY_SOURCE)
+        set_property(TARGET ${AUV3_TARGET} PROPERTY CLAP_WRAPPER_AUV3_FACTORY_SOURCE "${AUV3_FACTORY_SOURCE}")
+    endif()
     target_link_libraries(${AUV3_TARGET} PUBLIC ${AUV3_TARGET}-clap-wrapper-auv3-lib)
 
     if ("${CLAP_WRAPPER_BUNDLE_VERSION}" STREQUAL "")
