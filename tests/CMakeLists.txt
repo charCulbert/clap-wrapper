@@ -29,3 +29,11 @@ add_test(
         -DTEST_BINARY_ROOT=${CMAKE_CURRENT_BINARY_DIR}/clap-sdk-resolution
         -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/run-clap-sdk-resolution-tests.cmake
 )
+
+add_test(
+    NAME clap-first-auv3-standalone-option
+    COMMAND ${CMAKE_COMMAND}
+        -DCLAP_WRAPPER_SOURCE_DIR=${CLAP_WRAPPER_CMAKE_CURRENT_SOURCE_DIR}
+        -DTEST_BINARY_ROOT=${CMAKE_CURRENT_BINARY_DIR}/clap-first-auv3-standalone-option
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/run-clap-first-auv3-standalone-option-tests.cmake
+)

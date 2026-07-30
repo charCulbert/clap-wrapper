@@ -44,6 +44,8 @@ function(make_clapfirst_plugins)
             ASSET_OUTPUT_DIRECTORY
             RESOURCE_DIRECTORY # Entire directory to be copied into a bundle/folder's resources
 
+            AUV3_BUILD_STANDALONE # TRUE (default) to add the macOS AUv3 host app, FALSE for the appex only
+
             AUV2_MANUFACTURER_NAME # The AUV2 info. If absent we will probe the CLAP for the
             AUV2_MANUFACTURER_CODE # auv2 extension
             AUV2_SUBTYPE_CODE
@@ -54,6 +56,23 @@ function(make_clapfirst_plugins)
             STANDALONE_CONFIGURATIONS # standalone configuration. This is a list of target names and clap ids
     )
     cmake_parse_arguments(C1ST "" "${oneValueArgs}" "${multiValueArgs}" ${ARGN} )
+
+    if ("AUV3_BUILD_STANDALONE" IN_LIST C1ST_KEYWORDS_MISSING_VALUES)
+        message(FATAL_ERROR
+                "clap-wrapper: make_clapfirst_plugins AUV3_BUILD_STANDALONE requires TRUE or FALSE")
+    endif()
+
+    if (NOT DEFINED C1ST_AUV3_BUILD_STANDALONE)
+        set(C1ST_AUV3_BUILD_STANDALONE TRUE)
+    else()
+        string(TOUPPER "${C1ST_AUV3_BUILD_STANDALONE}" C1ST_AUV3_BUILD_STANDALONE)
+        if (NOT C1ST_AUV3_BUILD_STANDALONE STREQUAL "TRUE"
+                AND NOT C1ST_AUV3_BUILD_STANDALONE STREQUAL "FALSE")
+            message(FATAL_ERROR
+                    "clap-wrapper: make_clapfirst_plugins AUV3_BUILD_STANDALONE must be TRUE or FALSE; "
+                    "got '${C1ST_AUV3_BUILD_STANDALONE}'")
+        endif()
+    endif()
 
     if (DEFINED C1ST_COPY_AFTER_BUILD)
         set(CLAP_WRAPPER_COPY_AFTER_BUILD ${C1ST_COPY_AFTER_BUILD})
@@ -268,7 +287,9 @@ function(make_clapfirst_plugins)
         # target_add_auv3_standalone_wrapper is the AppKit host — on iOS the
         # separate target_add_auv3_standalone_ios_wrapper applies, which a
         # consuming project wires up itself (it involves signing decisions).
-        if (DEFINED C1ST_AUV2_MANUFACTURER_CODE AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+        if (C1ST_AUV3_BUILD_STANDALONE
+                AND DEFINED C1ST_AUV2_MANUFACTURER_CODE
+                AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
             set(AUV3SA_TARGET ${C1ST_TARGET_NAME}_auv3_standalone)
             message(STATUS "clap-wrapper: ClapFirst is making an AUv3 Standalone")
             add_executable(${AUV3SA_TARGET})
