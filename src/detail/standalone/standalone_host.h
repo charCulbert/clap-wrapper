@@ -158,6 +158,7 @@ struct StandaloneHost : Clap::IHost
   }
   std::atomic_bool parameterFlushRequested{false};
   void serviceParameterFlushRequestOnMainThread();
+  void serviceMainThreadRequests();
 
   bool gui_can_resize() override;
 
@@ -281,8 +282,10 @@ struct StandaloneHost : Clap::IHost
     startSampleRate = sr;
   }
 
-  void activatePlugin(int32_t sr, int32_t minBlock, int32_t maxBlock);
+  bool activatePlugin(int32_t sr, int32_t minBlock, int32_t maxBlock);
+  void deactivatePlugin();
   std::atomic_bool isActive{false};
+  ClapWrapper::detail::shared::ParameterFlushLifecycle parameterFlushLifecycle;
 
   std::vector<RtAudio::Api> getCompiledApi();
   std::vector<RtAudio::DeviceInfo> getInputAudioDevices();

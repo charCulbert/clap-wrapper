@@ -21,6 +21,10 @@ void AAX_CALLBACK AAXWrapper_AlgorithmProcessProc(
 
 void ClapAsAAX::process(SAAX_Wrapper_AlgorithmicContext *context)
 {
+  if (!_processing.load(std::memory_order_acquire) ||
+      !_activated.load(std::memory_order_acquire) || !_processAdapter)
+    return;
+
   // abort any flush request
   _flushRequested.store(false);
 

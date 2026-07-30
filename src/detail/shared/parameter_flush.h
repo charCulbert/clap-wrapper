@@ -1,10 +1,74 @@
 #pragma once
 
 #include <atomic>
+#include <mutex>
+#include <utility>
 #include <clap/clap.h>
 
 namespace ClapWrapper::detail::shared
 {
+
+// Main/idle coordination only. The steady audio process path must never acquire this mutex.
+class ParameterFlushLifecycle
+{
+ public:
+  bool requiresAudioThread() const noexcept
+  {
+    return _requiresAudioThread.load(std::memory_order_acquire);
+  }
+
+  template <typename Callback>
+  bool serviceIfInactive(Callback &&callback)
+  {
+    if (requiresAudioThread()) return false;
+
+    std::lock_guard<std::mutex> lock(_mutex);
+    if (requiresAudioThread()) return false;
+
+    std::forward<Callback>(callback)();
+    return true;
+  }
+
+  template <typename Callback>
+  bool activate(Callback &&callback)
+  {
+    _requiresAudioThread.store(true, std::memory_order_release);
+    std::lock_guard<std::mutex> lock(_mutex);
+
+    if (std::forward<Callback>(callback)()) return true;
+
+    _requiresAudioThread.store(false, std::memory_order_release);
+    return false;
+  }
+
+  template <typename Activate, typename Start, typename Rollback>
+  bool activateAndStart(Activate &&activateCallback, Start &&startCallback,
+                        Rollback &&rollbackCallback)
+  {
+    return activate(
+        [&]
+        {
+          if (!std::forward<Activate>(activateCallback)()) return false;
+          if (std::forward<Start>(startCallback)()) return true;
+
+          std::forward<Rollback>(rollbackCallback)();
+          return false;
+        });
+  }
+
+  template <typename Callback>
+  void deactivate(Callback &&callback)
+  {
+    _requiresAudioThread.store(true, std::memory_order_release);
+    std::lock_guard<std::mutex> lock(_mutex);
+    std::forward<Callback>(callback)();
+    _requiresAudioThread.store(false, std::memory_order_release);
+  }
+
+ private:
+  std::atomic_bool _requiresAudioThread{false};
+  std::mutex _mutex;
+};
 
 inline bool serviceParameterFlushRequest(const clap_plugin_t *plugin,
                                          const clap_plugin_params_t *params,

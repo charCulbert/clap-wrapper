@@ -43,7 +43,7 @@ void X11Gui::runloop()
     // no gui. Only way to kill us is with a signal.
     while (true)
     {
-      if (host) host->serviceParameterFlushRequestOnMainThread();
+      if (host) host->serviceMainThreadRequests();
       std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     }
     return;
@@ -53,7 +53,7 @@ void X11Gui::runloop()
   bool running{true};
   while (running)
   {
-    if (host) host->serviceParameterFlushRequestOnMainThread();
+    if (host) host->serviceMainThreadRequests();
     while (XPending(display))
     {
       XNextEvent(display, &e);

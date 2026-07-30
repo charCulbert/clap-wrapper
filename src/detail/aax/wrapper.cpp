@@ -100,8 +100,8 @@ AAXWrapper_inInstanceInitProc(const SAAX_Wrapper_AlgorithmicContext *inInstanceC
   {
     case AAX_eComponentInstanceInitAction_AddingNewInstance:
       LOGDETAIL("adding new instance");
-      self->activatePlugin();
-      self->startProcessing();
+      if (!self->activatePlugin() || !self->startProcessing())
+        return AAX_ERROR_NOT_INITIALIZED;
       break;
     case AAX_eComponentInstanceInitAction_RemovingInstance:
       LOGDETAIL("removing instance");
@@ -1198,8 +1198,7 @@ void ClapAsAAX::onIdle()
   // An activated CLAP requires flush() on its audio thread. Active parameter
   // output is transported by process(), so preserve the request until the
   // plugin is inactive instead of racing process() from the idle thread.
-  if (!_activated.load(std::memory_order_acquire))
-    serviceParameterFlushRequestOnMainThread();
+  serviceParameterFlushRequestOnMainThread();
 
   // process requests etc. on mainthread etc.
   if (_wants_on_main_thread.exchange(false))
@@ -1214,93 +1213,121 @@ void ClapAsAAX::serviceParameterFlushRequestOnMainThread()
 {
   if (!_plugin || !_plugin->_ext._params) return;
 
-  clap_output_events_t output = {};
-  output.ctx = this;
-  output.try_push = [](const clap_output_events_t *list,
-                       const clap_event_header_t *event) -> bool
-  {
-    if (event == nullptr || event->space_id != CLAP_CORE_EVENT_SPACE_ID) return false;
-    auto *self = static_cast<ClapAsAAX *>(list->ctx);
-    switch (event->type)
-    {
-      case CLAP_EVENT_PARAM_VALUE:
-        if (event->size < sizeof(clap_event_param_value_t)) return false;
-        self->onPerformEdit(reinterpret_cast<const clap_event_param_value_t *>(event));
-        return true;
-      case CLAP_EVENT_PARAM_GESTURE_BEGIN:
-        if (event->size < sizeof(clap_event_param_gesture_t)) return false;
-        self->onBeginEdit(reinterpret_cast<const clap_event_param_gesture_t *>(event)->param_id);
-        return true;
-      case CLAP_EVENT_PARAM_GESTURE_END:
-        if (event->size < sizeof(clap_event_param_gesture_t)) return false;
-        self->onEndEdit(reinterpret_cast<const clap_event_param_gesture_t *>(event)->param_id);
-        return true;
-      default:
-        return true;
-    }
-  };
+  _parameterFlushLifecycle.serviceIfInactive(
+      [&]
+      {
+        clap_output_events_t output = {};
+        output.ctx = this;
+        output.try_push = [](const clap_output_events_t *list,
+                             const clap_event_header_t *event) -> bool
+        {
+          if (event == nullptr || event->space_id != CLAP_CORE_EVENT_SPACE_ID) return false;
+          auto *self = static_cast<ClapAsAAX *>(list->ctx);
+          switch (event->type)
+          {
+            case CLAP_EVENT_PARAM_VALUE:
+              if (event->size < sizeof(clap_event_param_value_t)) return false;
+              self->onPerformEdit(reinterpret_cast<const clap_event_param_value_t *>(event));
+              return true;
+            case CLAP_EVENT_PARAM_GESTURE_BEGIN:
+              if (event->size < sizeof(clap_event_param_gesture_t)) return false;
+              self->onBeginEdit(
+                  reinterpret_cast<const clap_event_param_gesture_t *>(event)->param_id);
+              return true;
+            case CLAP_EVENT_PARAM_GESTURE_END:
+              if (event->size < sizeof(clap_event_param_gesture_t)) return false;
+              self->onEndEdit(
+                  reinterpret_cast<const clap_event_param_gesture_t *>(event)->param_id);
+              return true;
+            default:
+              return true;
+          }
+        };
 
-  auto mainThread = _plugin->AlwaysMainThread();
-  ClapWrapper::detail::shared::serviceParameterFlushRequest(
-      _plugin->_plugin, _plugin->_ext._params, &_flushRequested, &output);
+        auto mainThread = _plugin->AlwaysMainThread();
+        ClapWrapper::detail::shared::serviceParameterFlushRequest(
+            _plugin->_plugin, _plugin->_ext._params, &_flushRequested, &output);
+      });
 }
 
-void ClapAsAAX::activatePlugin()
+bool ClapAsAAX::activatePlugin()
 {
-  if (!_activated)
-  {
-    _gesturedparameters.reserve(8192);
+  if (_activated.load(std::memory_order_acquire)) return true;
 
-    _processAdapter = std::make_unique<AAXProcessAdapter>();
-    _processAdapter->setupProcessing(_plugin->_plugin, _plugin->getSampleRate(), _plugin->_ext._params,
-                                     _plugin->_ext._audioports, this, _gesturedparameters,
-                                     _paramsToProcess, _midi_first_portid, _midi_prefer_mididialect);
+  return _parameterFlushLifecycle.activate(
+      [&]
+      {
+        _gesturedparameters.reserve(8192);
 
-    _activated.store(true, std::memory_order_release);
-    if (!_plugin->activate())
-    {
-      _processAdapter.reset();
-      _activated.store(false, std::memory_order_release);
-      return;
-    }
+        _processAdapter = std::make_unique<AAXProcessAdapter>();
+        _processAdapter->setupProcessing(
+            _plugin->_plugin, _plugin->getSampleRate(), _plugin->_ext._params,
+            _plugin->_ext._audioports, this, _gesturedparameters, _paramsToProcess,
+            _midi_first_portid, _midi_prefer_mididialect);
 
-    // pass latency when activated
-    auto scope = _plugin->AlwaysMainThread();
-    auto newlatency = _plugin->_ext._latency->get(_plugin->_plugin);
-    if (newlatency != _latency)
-    {
-      _latency = newlatency;
-      _aax_ctrl->SetSignalLatency(_latency);
-    }
-  }
+        if (!_plugin->activate())
+        {
+          _processAdapter.reset();
+          return false;
+        }
+
+        _activated.store(true, std::memory_order_release);
+
+        // pass latency when activated
+        auto scope = _plugin->AlwaysMainThread();
+        auto newlatency = _plugin->_ext._latency->get(_plugin->_plugin);
+        if (newlatency != _latency)
+        {
+          _latency = newlatency;
+          _aax_ctrl->SetSignalLatency(_latency);
+        }
+        return true;
+      });
 }
 
 void ClapAsAAX::deactivatePlugin()
 {
-  if (_activated)
-  {
-    _plugin->deactivate();
-    _processAdapter.reset();
-    _activated.store(false, std::memory_order_release);
-  }
+  if (!_activated.load(std::memory_order_acquire)) return;
+
+  _parameterFlushLifecycle.deactivate(
+      [&]
+      {
+        _plugin->deactivate();
+        _processAdapter.reset();
+        _activated.store(false, std::memory_order_release);
+      });
 }
 
-void ClapAsAAX::startProcessing()
+bool ClapAsAAX::startProcessing()
 {
-  if (!_processing)
+  if (_processing.load(std::memory_order_acquire)) return true;
+  if (!_activated.load(std::memory_order_acquire)) return false;
+  if (!_processAdapter)
+  {
+    deactivatePlugin();
+    return false;
+  }
+
+  if (_plugin->start_processing())
   {
     _processing.store(true, std::memory_order_release);
-    if (!_plugin->start_processing()) _processing.store(false, std::memory_order_release);
+    return true;
   }
+
+  _parameterFlushLifecycle.deactivate(
+      [&]
+      {
+        _plugin->deactivate();
+        _processAdapter.reset();
+        _activated.store(false, std::memory_order_release);
+      });
+  return false;
 }
 
 void ClapAsAAX::stopProcessing()
 {
-  if (_processing)
-  {
+  if (_processing.exchange(false, std::memory_order_acq_rel))
     _plugin->stop_processing();
-    _processing.store(false, std::memory_order_release);
-  }
 }
 
 void ClapAsAAX::onBeginEdit(clap_id id)

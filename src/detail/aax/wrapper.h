@@ -233,9 +233,9 @@ class ClapAsAAX : public AAX_CEffectParameters,
   void onIdle() override;
   void serviceParameterFlushRequestOnMainThread();
 
-  void activatePlugin();
+  bool activatePlugin();
   void deactivatePlugin();
-  void startProcessing();
+  bool startProcessing();
   void stopProcessing();
 
   void process(SAAX_Wrapper_AlgorithmicContext *context);
@@ -263,6 +263,7 @@ class ClapAsAAX : public AAX_CEffectParameters,
   std::atomic<bool> _processing{false};
   std::atomic<bool> _wants_on_main_thread = false;
   std::atomic<bool> _flushRequested = false;
+  ClapWrapper::detail::shared::ParameterFlushLifecycle _parameterFlushLifecycle;
   uint32_t _latency = 0;
 
   std::unique_ptr<AAXProcessAdapter> _processAdapter;

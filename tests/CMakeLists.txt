@@ -1,5 +1,15 @@
 add_subdirectory(clap-first-example)
 
+find_package(Threads REQUIRED)
+add_executable(parameter-flush-lifecycle-tests parameter-flush-lifecycle-tests.cpp)
+target_include_directories(parameter-flush-lifecycle-tests PRIVATE
+    ../src
+    ${CLAP_SDK_ROOT}/include
+)
+target_compile_features(parameter-flush-lifecycle-tests PRIVATE cxx_std_17)
+target_link_libraries(parameter-flush-lifecycle-tests PRIVATE Threads::Threads)
+add_test(NAME parameter-flush-lifecycle COMMAND parameter-flush-lifecycle-tests)
+
 if (APPLE)
     add_subdirectory(clap-macos-embedded)
 

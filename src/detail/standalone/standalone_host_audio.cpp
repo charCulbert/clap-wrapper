@@ -257,7 +257,15 @@ void StandaloneHost::startAudioThreadOn(unsigned int inputDeviceID, uint32_t inp
     return;
   }
 
-  activatePlugin(sampleRate, 1, currentBufferSize * 2);
+  if (!activatePlugin(sampleRate, 1, currentBufferSize * 2))
+  {
+    LOGINFO("[ERROR] Plugin activation failed");
+    running.store(false, std::memory_order_release);
+    rtaDac->closeStream();
+    return;
+  }
+  running.store(true, std::memory_order_release);
+  finishedRunning.store(false, std::memory_order_release);
 
   LOGDETAIL("RtAudio Attached Devices");
   if (useOutput)
@@ -282,12 +290,18 @@ void StandaloneHost::startAudioThreadOn(unsigned int inputDeviceID, uint32_t inp
   if (!rtaDac->isStreamOpen())
   {
     LOGINFO("[ERROR] Stream failed to open :  {}", rtaDac->getErrorText());
+    running.store(false, std::memory_order_release);
+    deactivatePlugin();
+    rtaDac->closeStream();
     return;
   }
 
   if (rtaDac->startStream())
   {
     LOGINFO("[ERROR] startStream failed : {}", rtaDac->getErrorText());
+    running.store(false, std::memory_order_release);
+    deactivatePlugin();
+    rtaDac->closeStream();
     return;
   }
 }

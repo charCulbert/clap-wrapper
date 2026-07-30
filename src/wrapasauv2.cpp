@@ -192,7 +192,8 @@ OSStatus WrapAsAUV2::Initialize()
   // CLAP does not want it, therefore the wrapper insists on being in the
   // main thread
   auto guarantee_mainthread = _plugin->AlwaysMainThread();
-  activateCLAP();
+  if (!activateCLAP())
+    return kAudioUnitErr_FailedInitialization;
 
 #if 0
   // get our current numChannels for input and output
@@ -981,50 +982,60 @@ void WrapAsAUV2::addOutputBus(int bus, const clap_audio_port_info_t *info)
   busref.SetStreamFormat(sf);
 }
 
-void WrapAsAUV2::activateCLAP()
+bool WrapAsAUV2::activateCLAP()
 {
-  if (_plugin)
-  {
-    assert(!_initialized);
-    if (!_processAdapter) _processAdapter = std::make_unique<Clap::AUv2::ProcessAdapter>();
-    auto maxSampleFrames = Base::GetMaxFramesPerSlice();
-    auto minSampleFrames = (maxSampleFrames >= 16) ? 16 : 1;
-    _plugin->setBlockSizes(minSampleFrames, maxSampleFrames);
-    _plugin->setSampleRate(Output(0).GetStreamFormat().mSampleRate);
+  if (!_plugin) return false;
+  if (_initialized.load(std::memory_order_acquire)) return true;
 
-    _processAdapter->setupProcessing(Inputs(), Outputs(), _plugin->_plugin, _plugin->_ext._params, this,
-                                     &_parametertree, this, maxSampleFrames, _midi_preferred_dialect);
+  const bool started = _parameterFlushLifecycle.activateAndStart(
+      [&]
+      {
+        if (!_processAdapter) _processAdapter = std::make_unique<Clap::AUv2::ProcessAdapter>();
+        auto maxSampleFrames = Base::GetMaxFramesPerSlice();
+        auto minSampleFrames = (maxSampleFrames >= 16) ? 16 : 1;
+        _plugin->setBlockSizes(minSampleFrames, maxSampleFrames);
+        _plugin->setSampleRate(Output(0).GetStreamFormat().mSampleRate);
 
-    // Gate the idle flush path across activate/start as well as process.
-    _initialized.store(true, std::memory_order_release);
-    if (!_plugin->activate())
-    {
-      _processAdapter.reset();
-      _initialized.store(false, std::memory_order_release);
-      return;
-    }
-    if (!_plugin->start_processing())
-    {
-      _plugin->deactivate();
-      _processAdapter.reset();
-      _initialized.store(false, std::memory_order_release);
-    }
-  }
+        _processAdapter->setupProcessing(Inputs(), Outputs(), _plugin->_plugin,
+                                         _plugin->_ext._params, this, &_parametertree, this,
+                                         maxSampleFrames, _midi_preferred_dialect);
+
+        if (!_plugin->activate())
+        {
+          _processAdapter.reset();
+          return false;
+        }
+        return true;
+      },
+      [&] { return _plugin->start_processing(); },
+      [&]
+      {
+        _plugin->deactivate();
+        _processAdapter.reset();
+      });
+
+  _initialized.store(started, std::memory_order_release);
+  return started;
 }
 
 void WrapAsAUV2::deactivateCLAP()
 {
-  if (_plugin)
-  {
-    if (_initialized.load(std::memory_order_acquire))
-    {
-      _plugin->stop_processing();
-      _plugin->deactivate();
-      _initialized.store(false, std::memory_order_release);
-    }
-    _processAdapter.reset();
-  }
   _midioutput_hostcallback = {nullptr, nullptr};
+  if (!_plugin) return;
+  if (!_initialized.load(std::memory_order_acquire))
+  {
+    _processAdapter.reset();
+    return;
+  }
+
+  _parameterFlushLifecycle.deactivate(
+      [&]
+      {
+        _initialized.store(false, std::memory_order_release);
+        _plugin->stop_processing();
+        _plugin->deactivate();
+        _processAdapter.reset();
+      });
 }
 
 OSStatus WrapAsAUV2::Render(AudioUnitRenderActionFlags &inFlags, const AudioTimeStamp &inTimeStamp,
@@ -1157,8 +1168,7 @@ void WrapAsAUV2::onEndEdit(clap_id id)
 void WrapAsAUV2::onIdle()
 {
   if (!_plugin) return;
-  if (!_initialized.load(std::memory_order_acquire))
-    serviceParameterFlushRequestOnMainThread();
+  serviceParameterFlushRequestOnMainThread();
 
   // run queue stuff
   queueEvent e;
@@ -1218,35 +1228,41 @@ void WrapAsAUV2::serviceParameterFlushRequestOnMainThread()
 {
   if (!_plugin || !_plugin->_ext._params) return;
 
-  clap_output_events_t output = {};
-  output.ctx = this;
-  output.try_push = [](const clap_output_events_t *list,
-                       const clap_event_header_t *event) -> bool
-  {
-    if (event == nullptr || event->space_id != CLAP_CORE_EVENT_SPACE_ID) return false;
-    auto *self = static_cast<WrapAsAUV2 *>(list->ctx);
-    switch (event->type)
-    {
-      case CLAP_EVENT_PARAM_VALUE:
-        if (event->size < sizeof(clap_event_param_value_t)) return false;
-        self->onPerformEdit(reinterpret_cast<const clap_event_param_value_t *>(event));
-        return true;
-      case CLAP_EVENT_PARAM_GESTURE_BEGIN:
-        if (event->size < sizeof(clap_event_param_gesture_t)) return false;
-        self->onBeginEdit(reinterpret_cast<const clap_event_param_gesture_t *>(event)->param_id);
-        return true;
-      case CLAP_EVENT_PARAM_GESTURE_END:
-        if (event->size < sizeof(clap_event_param_gesture_t)) return false;
-        self->onEndEdit(reinterpret_cast<const clap_event_param_gesture_t *>(event)->param_id);
-        return true;
-      default:
-        return true;
-    }
-  };
+  _parameterFlushLifecycle.serviceIfInactive(
+      [&]
+      {
+        clap_output_events_t output = {};
+        output.ctx = this;
+        output.try_push = [](const clap_output_events_t *list,
+                             const clap_event_header_t *event) -> bool
+        {
+          if (event == nullptr || event->space_id != CLAP_CORE_EVENT_SPACE_ID) return false;
+          auto *self = static_cast<WrapAsAUV2 *>(list->ctx);
+          switch (event->type)
+          {
+            case CLAP_EVENT_PARAM_VALUE:
+              if (event->size < sizeof(clap_event_param_value_t)) return false;
+              self->onPerformEdit(reinterpret_cast<const clap_event_param_value_t *>(event));
+              return true;
+            case CLAP_EVENT_PARAM_GESTURE_BEGIN:
+              if (event->size < sizeof(clap_event_param_gesture_t)) return false;
+              self->onBeginEdit(
+                  reinterpret_cast<const clap_event_param_gesture_t *>(event)->param_id);
+              return true;
+            case CLAP_EVENT_PARAM_GESTURE_END:
+              if (event->size < sizeof(clap_event_param_gesture_t)) return false;
+              self->onEndEdit(
+                  reinterpret_cast<const clap_event_param_gesture_t *>(event)->param_id);
+              return true;
+            default:
+              return true;
+          }
+        };
 
-  auto mainThread = _plugin->AlwaysMainThread();
-  ClapWrapper::detail::shared::serviceParameterFlushRequest(
-      _plugin->_plugin, _plugin->_ext._params, &_parameterFlushRequested, &output);
+        auto mainThread = _plugin->AlwaysMainThread();
+        ClapWrapper::detail::shared::serviceParameterFlushRequest(
+            _plugin->_plugin, _plugin->_ext._params, &_parameterFlushRequested, &output);
+      });
 }
 
 OSStatus WrapAsAUV2::SaveState(CFPropertyListRef *ptPList)

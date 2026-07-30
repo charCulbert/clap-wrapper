@@ -104,7 +104,7 @@ void StandaloneHost::clapProcess(void *pOutput, const void *pInput, uint32_t fra
   ClapWrapper::detail::shared::SpinLockGuard processLockGuard(processLock);
   auto f = (float *)pOutput;
 
-  if (!running)
+  if (!running.load(std::memory_order_acquire) || !isActive.load(std::memory_order_acquire))
   {
     memset(f, 0, frameCount * currentOutputChannels * sizeof(float));
     finishedRunning = true;
@@ -246,11 +246,37 @@ const char *StandaloneHost::host_get_name()
 
 void StandaloneHost::serviceParameterFlushRequestOnMainThread()
 {
-  if (isActive.load(std::memory_order_acquire) || !clapPlugin || !clapPlugin->_ext._params) return;
+  if (!clapPlugin || !clapPlugin->_ext._params) return;
 
-  auto mainThread = clapPlugin->AlwaysMainThread();
-  ClapWrapper::detail::shared::serviceParameterFlushRequest(
-      clapPlugin->_plugin, clapPlugin->_ext._params, &parameterFlushRequested, &outputEvents);
+  parameterFlushLifecycle.serviceIfInactive(
+      [&]
+      {
+        auto mainThread = clapPlugin->AlwaysMainThread();
+        ClapWrapper::detail::shared::serviceParameterFlushRequest(
+            clapPlugin->_plugin, clapPlugin->_ext._params, &parameterFlushRequested, &outputEvents);
+      });
+}
+
+void StandaloneHost::serviceMainThreadRequests()
+{
+  serviceParameterFlushRequestOnMainThread();
+
+  if (callbackRequested.exchange(false) && clapPlugin)
+  {
+    auto mainThread = clapPlugin->AlwaysMainThread();
+    clapPlugin->_plugin->on_main_thread(clapPlugin->_plugin);
+  }
+
+  if (!restartRequested.exchange(false)) return;
+
+  {
+    ClapWrapper::detail::shared::SpinLockGuard lock(processLock);
+    running.store(false, std::memory_order_release);
+  }
+
+  const bool activated = activatePlugin(currentSampleRate, 1, currentBufferSize * 2);
+  running.store(activated, std::memory_order_release);
+  if (activated) finishedRunning.store(false, std::memory_order_release);
 }
 
 #if LIN
@@ -375,31 +401,39 @@ bool StandaloneHost::tryLoadStandaloneAndPluginSettings(const fs::path &fromDir,
   return true;
 }
 
-void StandaloneHost::activatePlugin(int32_t sr, int32_t minBlock, int32_t maxBlock)
+bool StandaloneHost::activatePlugin(int32_t sr, int32_t minBlock, int32_t maxBlock)
 {
+  if (!clapPlugin) return false;
+
   if (isActive.load(std::memory_order_acquire))
-  {
-    clapPlugin->stop_processing();
-    clapPlugin->deactivate();
-    isActive.store(false, std::memory_order_release);
-  }
+    deactivatePlugin();
 
-  LOGINFO("Activating plugin : sampleRate={} blockBounds={} to {}", sr, minBlock, maxBlock);
-  clapPlugin->setSampleRate(sr);
-  clapPlugin->setBlockSizes(minBlock, maxBlock);
-  // Gate idle flushes across the lifecycle transition as well as processing.
-  isActive.store(true, std::memory_order_release);
-  if (!clapPlugin->activate())
-  {
-    isActive.store(false, std::memory_order_release);
-    return;
-  }
+  const bool started = parameterFlushLifecycle.activateAndStart(
+      [&]
+      {
+        LOGINFO("Activating plugin : sampleRate={} blockBounds={} to {}", sr, minBlock, maxBlock);
+        clapPlugin->setSampleRate(sr);
+        clapPlugin->setBlockSizes(minBlock, maxBlock);
+        return clapPlugin->activate();
+      },
+      [&] { return clapPlugin->start_processing(); },
+      [&] { clapPlugin->deactivate(); });
 
-  if (!clapPlugin->start_processing())
-  {
-    clapPlugin->deactivate();
-    isActive.store(false, std::memory_order_release);
-  }
+  isActive.store(started, std::memory_order_release);
+  return started;
+}
+
+void StandaloneHost::deactivatePlugin()
+{
+  if (!clapPlugin || !isActive.load(std::memory_order_acquire)) return;
+
+  parameterFlushLifecycle.deactivate(
+      [&]
+      {
+        isActive.store(false, std::memory_order_release);
+        clapPlugin->stop_processing();
+        clapPlugin->deactivate();
+      });
 }
 
 }  // namespace freeaudio::clap_wrapper::standalone

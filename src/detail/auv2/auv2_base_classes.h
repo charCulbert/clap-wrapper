@@ -519,7 +519,7 @@ class WrapAsAUV2 : public ausdk::AUBase,
   void addInputBus(int bus, const clap_audio_port_info_t *info);
   void addOutputBus(int bus, const clap_audio_port_info_t *info);
 
-  void activateCLAP();
+  bool activateCLAP();
   void deactivateCLAP();
   bool IsBypassEffect()
   {
@@ -541,6 +541,7 @@ class WrapAsAUV2 : public ausdk::AUBase,
   std::unique_ptr<Clap::AUv2::ProcessAdapter> _processAdapter;
   std::atomic<bool> _initialized = false;
   std::atomic_bool _parameterFlushRequested = false;
+  ClapWrapper::detail::shared::ParameterFlushLifecycle _parameterFlushLifecycle;
 
   // some info about the wrapped clap
   uint32_t _midi_preferred_dialect = 0;
