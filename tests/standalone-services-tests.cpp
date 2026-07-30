@@ -65,6 +65,10 @@ bool testAbiAndNegotiation()
   truncated.struct_size = offsetof(clap_wrapper_standalone_audio_snapshot_t, selected);
   const bool rejected = !services.getAudioSnapshot(truncated);
 
+  clap_wrapper_standalone_audio_settings_t truncatedSettings{};
+  truncatedSettings.struct_size = offsetof(clap_wrapper_standalone_audio_settings_t, flags);
+  const bool settingsRejected = !services.applyAudioSettings(truncatedSettings);
+
   clap_wrapper_standalone_audio_snapshot_t negotiated{};
   negotiated.struct_size = sizeof(negotiated);
   const bool needsStorage = !services.getAudioSnapshot(negotiated) &&
@@ -75,6 +79,7 @@ bool testAbiAndNegotiation()
   negotiated.output_devices = &output;
   negotiated.output_device_capacity = 1;
   return expect(rejected, "truncated snapshot ABI is rejected") &&
+         expect(settingsRejected, "truncated audio settings ABI is rejected") &&
          expect(needsStorage, "snapshot reports required storage without partial output") &&
          expect(services.getAudioSnapshot(negotiated) && input.id == 10 && output.id == 20,
                 "snapshot succeeds after size negotiation");
@@ -251,6 +256,23 @@ bool testThreadAndLifecycleGating()
          expect(activeRejected, "device and MIDI lifecycle changes are gated while audio runs");
 }
 
+bool testMonoInputRoute()
+{
+  StandaloneServicesCore services;
+  auto input = audioDevice(10);
+  input.input_channels = 1;
+  services.setAudioDevices({input}, {audioDevice(20)});
+
+  clap_wrapper_standalone_audio_settings_t settings{};
+  settings.struct_size = sizeof(settings);
+  settings.input_device_id = input.id;
+  settings.input_channels = 1;
+  settings.flags = CLAP_WRAPPER_STANDALONE_AUDIO_INPUT_ENABLED;
+  return expect(services.applyAudioSettings(settings) &&
+                    services.selectedAudioSettings().input_channels == 1,
+                "mono input routes are valid service settings");
+}
+
 bool testMidiEndpointBindingSeam()
 {
   StandaloneServicesCore services;
@@ -276,13 +298,36 @@ bool testMidiEndpointBindingSeam()
   return expect(failureVisible && successVisible && closeVisible,
                 "endpoint binding seam keeps snapshots coherent across open failure, success and close");
 }
+
+bool testMidiRollbackState()
+{
+  StandaloneServicesCore services;
+  services.setAudioDevices({}, {audioDevice(20)});
+  services.setMidiPorts({midiPort(1), midiPort(2)});
+
+  clap_wrapper_standalone_audio_settings_t audio{};
+  audio.struct_size = sizeof(audio);
+  audio.output_device_id = 20;
+  audio.output_channels = 2;
+  audio.flags = CLAP_WRAPPER_STANDALONE_AUDIO_OUTPUT_ENABLED;
+  if (!services.applyAudioSettings(audio) || !services.setMidiPortOpen(2, false)) return false;
+
+  const auto previousAudio = services.selectedAudioSettings();
+  const auto previousMidi = services.selectedMidiPortIds();
+  const auto selectedNewPort = services.setMidiPortOpen(2, true);
+  const auto endpointFailure = services.setBoundMidiPortIds({1});
+  const auto restored = services.restoreSettings(previousAudio, previousMidi);
+  return expect(selectedNewPort && endpointFailure && restored &&
+                    services.selectedMidiPortIds() == previousMidi,
+                "failed MIDI endpoint change restores prior selection");
+}
 } // namespace
 
 int main()
 {
   return testAbiAndNegotiation() && testIngressOrderCapacityAndRamp() && testBoundedSortedDelivery() &&
                  testEnvelopeAndRollback() && testConcurrentIngress() && testThreadAndLifecycleGating()
-                 && testMidiEndpointBindingSeam()
+                 && testMonoInputRoute() && testMidiEndpointBindingSeam() && testMidiRollbackState()
              ? 0
              : 1;
 }

@@ -47,8 +47,9 @@ bool CLAP_ABI applyAudioSettings(const clap_host_t *host,
   auto *standalone = standaloneHostFor(host);
   if (standalone == nullptr || settings == nullptr || !standalone->services.isMainThread())
     return false;
+  if (settings->struct_size < sizeof(*settings)) return false;
   if (((settings->flags & CLAP_WRAPPER_STANDALONE_AUDIO_INPUT_ENABLED) != 0 &&
-       settings->input_channels != 2) ||
+       (settings->input_channels == 0 || settings->input_channels > 2)) ||
       ((settings->flags & CLAP_WRAPPER_STANDALONE_AUDIO_OUTPUT_ENABLED) != 0 &&
        settings->output_channels != 2))
     return false;
@@ -76,6 +77,8 @@ bool CLAP_ABI setMidiPortOpen(const clap_host_t *host, uint64_t portId, bool sho
   auto *standalone = standaloneHostFor(host);
   if (standalone == nullptr || !standalone->services.isMainThread()) return false;
   const auto restartAudio = standalone->services.isAudioRunning();
+  const auto previousAudio = standalone->services.selectedAudioSettings();
+  const auto previousMidi = standalone->services.selectedMidiPortIds();
   if (restartAudio)
   {
     standalone->stopAudioThread();
@@ -84,8 +87,15 @@ bool CLAP_ABI setMidiPortOpen(const clap_host_t *host, uint64_t portId, bool sho
   standalone->refreshMidiServiceSnapshot();
   const auto changed = standalone->services.setMidiPortOpen(portId, shouldOpen);
   const auto rebound = changed && standalone->rebuildMIDIEndpoints();
-  const auto restarted = !restartAudio || standalone->startAudioThread();
-  return rebound && restarted;
+  const auto restarted = rebound && (!restartAudio || standalone->startAudioThread());
+  if (restarted) return true;
+
+  const auto restored = standalone->services.restoreSettings(previousAudio, previousMidi);
+  const auto restoredMidi = restored && standalone->rebuildMIDIEndpoints();
+  const auto restoredAudio = !restartAudio || (restoredMidi && standalone->startAudioThread());
+  if (!restoredMidi || !restoredAudio)
+    LOGINFO("[ERROR] MIDI service change failed and prior configuration could not be restored");
+  return false;
 }
 
 bool CLAP_ABI enqueueEvent(const clap_host_t *host, const clap_event_header_t *event, uint32_t eventSize,
@@ -250,7 +260,8 @@ bool StandaloneHost::restoreServiceSettings(const clap_wrapper_standalone_audio_
 {
   refreshAudioServiceSnapshot();
   refreshMidiServiceSnapshot();
-  if (((audio.flags & CLAP_WRAPPER_STANDALONE_AUDIO_INPUT_ENABLED) != 0 && audio.input_channels != 2) ||
+  if (((audio.flags & CLAP_WRAPPER_STANDALONE_AUDIO_INPUT_ENABLED) != 0 &&
+       (audio.input_channels == 0 || audio.input_channels > 2)) ||
       ((audio.flags & CLAP_WRAPPER_STANDALONE_AUDIO_OUTPUT_ENABLED) != 0 && audio.output_channels != 2))
     return false;
   if (!services.restoreSettings(audio, midiPorts)) return false;
@@ -361,15 +372,29 @@ void StandaloneHost::clapProcess(void *pOutput, const void *pInput, uint32_t fra
   {
     // For now assert sterep
     assert(inputChannelByBus[inp] == 2);
-    const auto isMainInput = inp == mainInput && pInput != nullptr && currentInputChannels >= 2;
-    bufferChanPtr[ptrIdx] = isMainInput ? static_cast<float *>(const_cast<void *>(pInput))
-                                        : &(utilityBuffer[ptrIdx][0]);
-    if (!isMainInput) memset(bufferChanPtr[ptrIdx], 0, frameCount * sizeof(float));
-    ptrIdx++;
-    bufferChanPtr[ptrIdx] = isMainInput ? static_cast<float *>(const_cast<void *>(pInput)) + frameCount
-                                        : &(utilityBuffer[ptrIdx][0]);
-    if (!isMainInput) memset(bufferChanPtr[ptrIdx], 0, frameCount * sizeof(float));
-    ptrIdx++;
+    const auto isMainInput = inp == mainInput && pInput != nullptr;
+    if (isMainInput && currentInputChannels >= 2)
+    {
+      bufferChanPtr[ptrIdx++] = static_cast<float *>(const_cast<void *>(pInput));
+      bufferChanPtr[ptrIdx++] = static_cast<float *>(const_cast<void *>(pInput)) + frameCount;
+    }
+    else if (isMainInput && currentInputChannels == 1)
+    {
+      const auto *monoInput = static_cast<const float *>(pInput);
+      bufferChanPtr[ptrIdx] = &(utilityBuffer[ptrIdx][0]);
+      std::memcpy(bufferChanPtr[ptrIdx], monoInput, frameCount * sizeof(float));
+      ptrIdx++;
+      bufferChanPtr[ptrIdx] = &(utilityBuffer[ptrIdx][0]);
+      std::memcpy(bufferChanPtr[ptrIdx], monoInput, frameCount * sizeof(float));
+      ptrIdx++;
+    }
+    else
+    {
+      bufferChanPtr[ptrIdx] = &(utilityBuffer[ptrIdx][0]);
+      memset(bufferChanPtr[ptrIdx++], 0, frameCount * sizeof(float));
+      bufferChanPtr[ptrIdx] = &(utilityBuffer[ptrIdx][0]);
+      memset(bufferChanPtr[ptrIdx++], 0, frameCount * sizeof(float));
+    }
 
     buffers[bufIdx].channel_count = 2;
     buffers[bufIdx].data32 = &(bufferChanPtr[ptrIdx - 2]);

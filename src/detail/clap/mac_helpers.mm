@@ -100,15 +100,13 @@ std::string toString(const CFStringRef aString)
     return std::string();
   }
 
-  std::string result;
-
   CFIndex length = CFStringGetLength(aString);
   CFIndex maxSize = CFStringGetMaximumSizeForEncoding(length, kCFStringEncodingUTF8) + 1;
-  result.reserve(maxSize);
+  std::vector<char> buffer(static_cast<size_t>(maxSize));
 
-  if (CFStringGetCString(aString, result.data(), maxSize, kCFStringEncodingUTF8))
+  if (CFStringGetCString(aString, buffer.data(), maxSize, kCFStringEncodingUTF8))
   {
-    return result;
+    return buffer.data();
   }
 
   return std::string();
