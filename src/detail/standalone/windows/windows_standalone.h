@@ -399,7 +399,7 @@ struct Plugin final : public Window
   void startMIDI();
 
   void initializeAudio(RtAudio::Api api = RtAudio::Api::WINDOWS_WASAPI);
-  void startAudio();
+  [[nodiscard]] bool startAudio();
 
   freeaudio::clap_wrapper::standalone::StandaloneHost *sah{
       freeaudio::clap_wrapper::standalone::getStandaloneHost()};

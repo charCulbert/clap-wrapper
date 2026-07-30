@@ -8,7 +8,7 @@ namespace freeaudio::clap_wrapper::standalone
 {
 std::shared_ptr<Clap::Plugin> mainCreatePlugin(const clap_plugin_entry *entry, const std::string &clapId,
                                                uint32_t clapIndex, int argc, char **argv);
-void mainStartAudio();
+[[nodiscard]] bool mainStartAudio();
 
 std::shared_ptr<Clap::Plugin> getMainPlugin();
 

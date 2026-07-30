@@ -84,7 +84,7 @@ std::tuple<unsigned int, unsigned int, int32_t> StandaloneHost::getDefaultAudioI
 
   return {iid, oid, (int32_t)sr};
 }
-void StandaloneHost::startAudioThread()
+bool StandaloneHost::startAudioThread()
 {
   guaranteeRtAudioDAC();
 
@@ -93,13 +93,12 @@ void StandaloneHost::startAudioThread()
     auto in = startAudioIn;
     auto out = startAudioOut;
     auto sr = startSampleRate;
-    startAudioThreadOn(in, 2, in > 0 && numAudioInputs > 0, out, 2, out > 0 && numAudioOutputs > 0, sr);
+    return startAudioThreadOn(in, 2, in > 0 && numAudioInputs > 0, out, 2,
+                              out > 0 && numAudioOutputs > 0, sr);
   }
-  else
-  {
-    auto [in, out, sr] = getDefaultAudioInOutSampleRate();
-    startAudioThreadOn(in, 2, numAudioInputs > 0, out, 2, numAudioOutputs > 0, sr);
-  }
+
+  auto [in, out, sr] = getDefaultAudioInOutSampleRate();
+  return startAudioThreadOn(in, 2, numAudioInputs > 0, out, 2, numAudioOutputs > 0, sr);
 }
 
 std::vector<RtAudio::DeviceInfo> filterDevicesBy(const std::unique_ptr<RtAudio> &rtaDac,
@@ -166,18 +165,16 @@ std::vector<uint32_t> StandaloneHost::getBufferSizes()
   return res;
 }
 
-void StandaloneHost::startAudioThreadOn(unsigned int inputDeviceID, uint32_t inputChannels,
+bool StandaloneHost::startAudioThreadOn(unsigned int inputDeviceID, uint32_t inputChannels,
                                         bool useInput, unsigned int outputDeviceID,
-                                        uint32_t outputChannels, bool useOutput, int32_t reqSampleRate)
+                                        uint32_t outputChannels, bool useOutput,
+                                        int32_t reqSampleRate)
 {
   guaranteeRtAudioDAC();
 
   if (rtaDac->isStreamRunning())
-  {
     stopAudioThread();
-    running = true;
-    finishedRunning = false;
-  }
+  running.store(false, std::memory_order_release);
 
   audioInputDeviceID = inputDeviceID;
   audioInputUsed = useInput;
@@ -253,8 +250,9 @@ void StandaloneHost::startAudioThreadOn(unsigned int inputDeviceID, uint32_t inp
                          &options))
   {
     LOGINFO("[ERROR] Error opening rta stream '{}'", rtaDac->getErrorText());
+    deactivatePlugin();
     rtaDac->closeStream();
-    return;
+    return false;
   }
 
   if (!activatePlugin(sampleRate, 1, currentBufferSize * 2))
@@ -262,10 +260,8 @@ void StandaloneHost::startAudioThreadOn(unsigned int inputDeviceID, uint32_t inp
     LOGINFO("[ERROR] Plugin activation failed");
     running.store(false, std::memory_order_release);
     rtaDac->closeStream();
-    return;
+    return false;
   }
-  running.store(true, std::memory_order_release);
-  finishedRunning.store(false, std::memory_order_release);
 
   LOGDETAIL("RtAudio Attached Devices");
   if (useOutput)
@@ -293,7 +289,7 @@ void StandaloneHost::startAudioThreadOn(unsigned int inputDeviceID, uint32_t inp
     running.store(false, std::memory_order_release);
     deactivatePlugin();
     rtaDac->closeStream();
-    return;
+    return false;
   }
 
   if (rtaDac->startStream())
@@ -302,8 +298,12 @@ void StandaloneHost::startAudioThreadOn(unsigned int inputDeviceID, uint32_t inp
     running.store(false, std::memory_order_release);
     deactivatePlugin();
     rtaDac->closeStream();
-    return;
+    return false;
   }
+
+  running.store(true, std::memory_order_release);
+  finishedRunning.store(false, std::memory_order_release);
+  return true;
 }
 
 void StandaloneHost::stopAudioThread()

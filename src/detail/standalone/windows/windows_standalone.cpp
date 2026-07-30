@@ -772,7 +772,7 @@ Plugin::Plugin(std::shared_ptr<Clap::Plugin> clapPlugin, int nCmdShow)
                    SetMenuItemInfoW(getSystemMenu(hwnd.get()), 1, FALSE, &menu.item[1]);
 
                    saveSettings();
-                   startAudio();
+                   if (!startAudio()) return 0;
 
                    return 0;
                  }
@@ -894,7 +894,7 @@ Plugin::Plugin(std::shared_ptr<Clap::Plugin> clapPlugin, int nCmdShow)
             settings.bufferSize.set(std::to_string(sah->currentBufferSize));
 
             saveSettings();
-            startAudio();
+            if (!startAudio()) return 0;
           }
 
           if (LOWORD(msg.wparam) == Settings::Identifier::AudioOutput)
@@ -908,7 +908,7 @@ Plugin::Plugin(std::shared_ptr<Clap::Plugin> clapPlugin, int nCmdShow)
             refreshBufferSizes();
 
             saveSettings();
-            startAudio();
+            if (!startAudio()) return 0;
           }
 
           if (LOWORD(msg.wparam) == Settings::Identifier::AudioInput)
@@ -921,7 +921,7 @@ Plugin::Plugin(std::shared_ptr<Clap::Plugin> clapPlugin, int nCmdShow)
             refreshBufferSizes();
 
             saveSettings();
-            startAudio();
+            if (!startAudio()) return 0;
           }
 
           if (LOWORD(msg.wparam) == Settings::Identifier::AudioSamplerate)
@@ -933,7 +933,7 @@ Plugin::Plugin(std::shared_ptr<Clap::Plugin> clapPlugin, int nCmdShow)
             sah->currentSampleRate = newRate;
 
             saveSettings();
-            startAudio();
+            if (!startAudio()) return 0;
           }
 
           if (LOWORD(msg.wparam) == Settings::Identifier::AudioBuffersize)
@@ -945,7 +945,7 @@ Plugin::Plugin(std::shared_ptr<Clap::Plugin> clapPlugin, int nCmdShow)
             sah->currentBufferSize = bufferSize;
 
             saveSettings();
-            startAudio();
+            if (!startAudio()) return 0;
           }
         }
 
@@ -1171,7 +1171,8 @@ Plugin::Plugin(std::shared_ptr<Clap::Plugin> clapPlugin, int nCmdShow)
 
   refreshLayout();
 
-  startAudio();
+  if (!startAudio())
+    LOGINFO("[ERROR] Initial standalone audio startup failed");
 
   // Honor the show state requested by the launcher (shortcut "Run:" / STARTUPINFO),
   // falling back to a normal window. SW_HIDE would otherwise leave us invisible-but-running.
@@ -1418,10 +1419,11 @@ void Plugin::initializeAudio(RtAudio::Api api)
   sah->currentBufferSize = sah->getBufferSizes()[0];
 }
 
-void Plugin::startAudio()
+bool Plugin::startAudio()
 {
-  sah->startAudioThreadOn(sah->audioInputDeviceID, sah->totalInputChannels, sah->audioInputUsed,
-                          sah->audioOutputDeviceID, sah->totalOutputChannels, sah->audioOutputUsed,
-                          sah->currentSampleRate);
+  return sah->startAudioThreadOn(
+      sah->audioInputDeviceID, sah->totalInputChannels, sah->audioInputUsed,
+      sah->audioOutputDeviceID, sah->totalOutputChannels, sah->audioOutputUsed,
+      sah->currentSampleRate);
 }
 }  // namespace freeaudio::clap_wrapper::standalone::windows_standalone

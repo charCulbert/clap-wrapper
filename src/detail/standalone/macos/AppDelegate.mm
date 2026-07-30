@@ -204,7 +204,8 @@
     }
   };
 
-  freeaudio::clap_wrapper::standalone::mainStartAudio();
+  if (!freeaudio::clap_wrapper::standalone::mainStartAudio())
+    NSLog(@"Standalone audio startup failed");
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)aNotification
@@ -509,9 +510,8 @@
     const auto sr = [[[sampleRateSelection selectedItem] title] integerValue];
 
     auto standaloneHost = freeaudio::clap_wrapper::standalone::getStandaloneHost();
-    standaloneHost->startAudioThreadOn(inId, 2, useIn, outId, 2, useOut, (int32_t)sr);
-
-    [self close];
+    if (standaloneHost->startAudioThreadOn(inId, 2, useIn, outId, 2, useOut, (int32_t)sr))
+      [self close];
   }
 }
 

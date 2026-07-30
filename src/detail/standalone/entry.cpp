@@ -86,10 +86,13 @@ std::shared_ptr<Clap::Plugin> mainCreatePlugin(const clap_plugin_entry *ee, cons
   return plugin;
 }
 
-void mainStartAudio()
+bool mainStartAudio()
 {
   standaloneHost->startMIDIThread();
-  standaloneHost->startAudioThread();
+  if (standaloneHost->startAudioThread()) return true;
+
+  standaloneHost->stopMIDIThread();
+  return false;
 }
 
 std::shared_ptr<Clap::Plugin> getMainPlugin()

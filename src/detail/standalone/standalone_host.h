@@ -265,10 +265,10 @@ struct StandaloneHost : Clap::IHost
   void guaranteeRtAudioDAC();
   void setAudioApi(RtAudio::Api api);
   std::tuple<unsigned int, unsigned int, int32_t> getDefaultAudioInOutSampleRate();
-  void startAudioThread();
-  void startAudioThreadOn(unsigned int inputDeviceID, uint32_t inputChannels, bool useInput,
-                          unsigned int outputDeviceID, uint32_t outputChannels, bool useOutput,
-                          int32_t sampleRate);
+  [[nodiscard]] bool startAudioThread();
+  [[nodiscard]] bool startAudioThreadOn(unsigned int inputDeviceID, uint32_t inputChannels,
+                                        bool useInput, unsigned int outputDeviceID,
+                                        uint32_t outputChannels, bool useOutput, int32_t sampleRate);
   void stopAudioThread();
 
   bool startupAudioSet{false};
