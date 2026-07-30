@@ -23,14 +23,47 @@ struct TestState
 {
   MetadataMode metadataMode = MetadataMode::absent;
   const char *identifier = nullptr;
+  const clap_host_t *host = nullptr;
   uint32_t metadataCapacity = 0;
   uint32_t metadataStructSize = 0;
   uint32_t metadataCalls = 0;
+  bool metadataCheckedHostMainThread = false;
+  bool metadataSawHostMainThread = false;
+};
+
+struct ThreadCheckHost
+{
+  bool isMainThread = false;
+  clap_host_t host{};
 };
 
 constexpr uint32_t fieldEnd(size_t offset, size_t fieldSize)
 {
   return static_cast<uint32_t>(offset + fieldSize);
+}
+
+bool CLAP_ABI isMainThread(const clap_host_t *host)
+{
+  return static_cast<ThreadCheckHost *>(host->host_data)->isMainThread;
+}
+
+bool CLAP_ABI isAudioThread(const clap_host_t *host)
+{
+  return !isMainThread(host);
+}
+
+const clap_host_thread_check_t threadCheck{isMainThread, isAudioThread};
+
+const void *CLAP_ABI getHostExtension(const clap_host_t *, const char *id)
+{
+  return std::strcmp(id, CLAP_EXT_THREAD_CHECK) == 0 ? &threadCheck : nullptr;
+}
+
+void initialiseThreadCheckHost(ThreadCheckHost &result, bool isMainThread)
+{
+  result.isMainThread = isMainThread;
+  result.host = {CLAP_VERSION, &result,          "Metadata Test", "clap-wrapper", "",
+                 "1",          getHostExtension, nullptr,         nullptr,        nullptr};
 }
 
 bool CLAP_ABI getParameterMetadata(const clap_plugin_t *plugin, clap_id parameterId,
@@ -42,6 +75,15 @@ bool CLAP_ABI getParameterMetadata(const clap_plugin_t *plugin, clap_id paramete
   state.metadataCapacity = metadataCapacity;
   state.metadataStructSize = metadata ? metadata->struct_size : 0;
   if (!metadata || parameterId != 17) return false;
+
+  if (state.host)
+  {
+    const auto *threadCheck = static_cast<const clap_host_thread_check_t *>(
+        state.host->get_extension(state.host, CLAP_EXT_THREAD_CHECK));
+    state.metadataCheckedHostMainThread = threadCheck && threadCheck->is_main_thread;
+    state.metadataSawHostMainThread =
+        state.metadataCheckedHostMainThread && threadCheck->is_main_thread(state.host);
+  }
 
   if (state.metadataMode == MetadataMode::partial)
   {
@@ -204,6 +246,18 @@ void testPresentMetadataAndInstances()
   assert(firstState.metadataStructSize == sizeof(chardio_auv3_parameter_metadata_t));
 }
 
+void testInitialTreeConstructionSeesHostMainThread()
+{
+  ThreadCheckHost host;
+  initialiseThreadCheckHost(host, true);
+  TestState state{MetadataMode::present, "com_example_initial_speed", &host.host};
+  auto plugin = makePlugin(state);
+  auto result = Clap::AUv3::createParameterTree(&plugin, &parameters);
+  firstParameter(result.tree);
+  assert(state.metadataCheckedHostMainThread);
+  assert(state.metadataSawHostMainThread);
+}
+
 void testPartialAndUnavailableMetadata()
 {
   TestState partialState{MetadataMode::partial, "com_example_partial_speed"};
@@ -241,6 +295,7 @@ int main()
   @autoreleasepool
   {
     testPresentMetadataAndInstances();
+    testInitialTreeConstructionSeesHostMainThread();
     testPartialAndUnavailableMetadata();
     testReservedIdentifierFallsBack();
   }

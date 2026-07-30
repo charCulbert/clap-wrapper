@@ -316,6 +316,7 @@ class AUv3ImplDetail : public Clap::IHost, public Clap::IAutomation, public os::
 
   void setupParameters(const clap_plugin_t *plugin, const clap_plugin_params_t *params) override
   {
+    auto mainGuard = _plugin->AlwaysMainThread();
     auto result = Clap::AUv3::createParameterTree(plugin, params);
     _parameterTree = result.tree;
     _bypassParamId = result.bypassParamId;
