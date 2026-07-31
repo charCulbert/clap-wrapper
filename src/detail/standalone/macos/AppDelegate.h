@@ -12,7 +12,4 @@
 
 - (IBAction)openAudioSettingsWindow:(id)sender;
 
-- (IBAction)streamWrapperFileAs:(id)sender;
-- (IBAction)openWrapperFile:(id)sender;
-
 @end

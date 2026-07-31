@@ -60,7 +60,8 @@ bool CLAP_ABI applyAudioSettings(const clap_host_t *host,
       settings->input_channels, static_cast<unsigned int>(settings->output_device_id), settings->output_channels,
       static_cast<int>(settings->sample_rate),
       (settings->flags & CLAP_WRAPPER_STANDALONE_AUDIO_INPUT_ENABLED) != 0,
-      (settings->flags & CLAP_WRAPPER_STANDALONE_AUDIO_OUTPUT_ENABLED) != 0);
+      (settings->flags & CLAP_WRAPPER_STANDALONE_AUDIO_OUTPUT_ENABLED) != 0,
+      (settings->flags & CLAP_WRAPPER_STANDALONE_AUDIO_FOLLOW_DEFAULT_OUTPUT) != 0);
   standalone->currentBufferSize = settings->buffer_size;
   return true;
 }
@@ -245,7 +246,7 @@ void StandaloneHost::refreshAudioServiceSnapshot()
   {
     clap_wrapper_standalone_audio_device_t device{};
     device.struct_size = sizeof(device);
-    device.id = info.ID;
+    device.id = info.id;
     device.input_channels = info.inputChannels;
     device.output_channels = info.outputChannels;
     std::strncpy(device.name, info.name.c_str(), sizeof(device.name) - 1);
@@ -255,7 +256,7 @@ void StandaloneHost::refreshAudioServiceSnapshot()
   {
     clap_wrapper_standalone_audio_device_t device{};
     device.struct_size = sizeof(device);
-    device.id = info.ID;
+    device.id = info.id;
     device.input_channels = info.inputChannels;
     device.output_channels = info.outputChannels;
     std::strncpy(device.name, info.name.c_str(), sizeof(device.name) - 1);
@@ -266,22 +267,16 @@ void StandaloneHost::refreshAudioServiceSnapshot()
 
 void StandaloneHost::refreshMidiServiceSnapshot()
 {
+  refreshDeviceCaches();
   std::vector<clap_wrapper_standalone_midi_port_t> ports;
-  try
+  for (std::size_t i = 0; i < midiInputDevices.size(); ++i)
   {
-    RtMidiIn midi;
-    const auto count = midi.getPortCount();
-    for (unsigned int i = 0; i < count; ++i)
-    {
-      clap_wrapper_standalone_midi_port_t port{};
-      port.struct_size = sizeof(port);
-      port.id = i + 1;
-      std::strncpy(port.name, midi.getPortName(i).c_str(), sizeof(port.name) - 1);
-      ports.push_back(port);
-    }
-  }
-  catch (const RtMidiError &)
-  {
+    clap_wrapper_standalone_midi_port_t port{};
+    port.struct_size = sizeof(port);
+    port.id = i + 1;
+    std::strncpy(port.name, midiInputDevices[i].c_str(),
+                 sizeof(port.name) - 1);
+    ports.push_back(port);
   }
   services.setMidiPorts(std::move(ports));
 }
@@ -296,11 +291,12 @@ bool StandaloneHost::restoreServiceSettings(const clap_wrapper_standalone_audio_
       ((audio.flags & CLAP_WRAPPER_STANDALONE_AUDIO_OUTPUT_ENABLED) != 0 && audio.output_channels != 2))
     return false;
   if (!services.restoreSettings(audio, midiPorts)) return false;
-  setStartupAudio(static_cast<unsigned int>(audio.input_device_id),
-                  audio.input_channels, static_cast<unsigned int>(audio.output_device_id), audio.output_channels,
+  setStartupAudio(audio.input_device_id,
+                  audio.input_channels, audio.output_device_id, audio.output_channels,
                   static_cast<int>(audio.sample_rate),
                   (audio.flags & CLAP_WRAPPER_STANDALONE_AUDIO_INPUT_ENABLED) != 0,
-                  (audio.flags & CLAP_WRAPPER_STANDALONE_AUDIO_OUTPUT_ENABLED) != 0);
+                  (audio.flags & CLAP_WRAPPER_STANDALONE_AUDIO_OUTPUT_ENABLED) != 0,
+                  (audio.flags & CLAP_WRAPPER_STANDALONE_AUDIO_FOLLOW_DEFAULT_OUTPUT) != 0);
   currentBufferSize = audio.buffer_size;
   return true;
 }
@@ -364,18 +360,26 @@ void StandaloneHost::setupMIDIBusses(const clap_plugin_t *plugin,
   }
 }
 
-void StandaloneHost::clapProcess(void *pOutput, const void *pInput, uint32_t frameCount)
+void StandaloneHost::clapProcess(
+    choc::buffer::ChannelArrayView<const float> input,
+    choc::buffer::ChannelArrayView<float> output,
+    const DeviceMIDIEvent *midi, uint32_t midiCount,
+    const choc::audio::AudioMIDIBlockDispatcher::HandleMIDIMessageFn
+        &midiOutput)
 {
+  const auto frameCount = output.getNumFrames();
   const auto now = std::chrono::steady_clock::now().time_since_epoch();
   services.beginAudioBlock(
-      frameCount, currentSampleRate > 0 ? static_cast<uint32_t>(currentSampleRate) : 0,
+      frameCount,
+      currentSampleRate.load(std::memory_order_acquire) > 0
+          ? static_cast<uint32_t>(
+                currentSampleRate.load(std::memory_order_relaxed))
+          : 0,
       static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now).count()));
-  auto f = (float *)pOutput;
 
   if (!running.load(std::memory_order_acquire) || !isActive.load(std::memory_order_acquire))
   {
-    if (f != nullptr && currentOutputChannels != 0)
-      memset(f, 0, frameCount * currentOutputChannels * sizeof(float));
+    output.clear();
     finishedRunning = true;
     services.endAudioBlock();
     return;
@@ -396,8 +400,6 @@ void StandaloneHost::clapProcess(void *pOutput, const void *pInput, uint32_t fra
     std::terminate();
   }
 
-  process.audio_outputs_count = 1;
-
   float *bufferChanPtr[utilityBufferMaxChannels]{};
   clap_audio_buffer buffers[utilityBufferMaxChannels]{};  // probably twice as large
   size_t ptrIdx{0};
@@ -408,15 +410,18 @@ void StandaloneHost::clapProcess(void *pOutput, const void *pInput, uint32_t fra
   {
     // For now assert sterep
     assert(inputChannelByBus[inp] == 2);
-    const auto isMainInput = inp == mainInput && pInput != nullptr;
-    if (isMainInput && currentInputChannels >= 2)
+    const auto isMainInput =
+        inp == mainInput && input.getNumChannels() != 0;
+    if (isMainInput && input.getNumChannels() >= 2)
     {
-      bufferChanPtr[ptrIdx++] = static_cast<float *>(const_cast<void *>(pInput));
-      bufferChanPtr[ptrIdx++] = static_cast<float *>(const_cast<void *>(pInput)) + frameCount;
+      bufferChanPtr[ptrIdx++] = const_cast<float *>(
+          input.getIterator(0).sample);
+      bufferChanPtr[ptrIdx++] = const_cast<float *>(
+          input.getIterator(1).sample);
     }
-    else if (isMainInput && currentInputChannels == 1)
+    else if (isMainInput)
     {
-      const auto *monoInput = static_cast<const float *>(pInput);
+      const auto *monoInput = input.getIterator(0).sample;
       bufferChanPtr[ptrIdx] = &(utilityBuffer[ptrIdx][0]);
       std::memcpy(bufferChanPtr[ptrIdx], monoInput, frameCount * sizeof(float));
       ptrIdx++;
@@ -443,11 +448,15 @@ void StandaloneHost::clapProcess(void *pOutput, const void *pInput, uint32_t fra
   {
     // For now assert sterep
     assert(outputChannelByBus[oup] == 2);
-    const auto isMainOutput = oup == mainOutput && pOutput != nullptr && currentOutputChannels >= 2;
-    bufferChanPtr[ptrIdx] = isMainOutput ? static_cast<float *>(pOutput) : &(utilityBuffer[ptrIdx][0]);
+    const auto isMainOutput =
+        oup == mainOutput && output.getNumChannels() >= 2;
+    bufferChanPtr[ptrIdx] =
+        isMainOutput ? output.getIterator(0).sample
+                     : &(utilityBuffer[ptrIdx][0]);
     ptrIdx++;
-    bufferChanPtr[ptrIdx] = isMainOutput ? static_cast<float *>(pOutput) + frameCount
-                                          : &(utilityBuffer[ptrIdx][0]);
+    bufferChanPtr[ptrIdx] =
+        isMainOutput ? output.getIterator(1).sample
+                     : &(utilityBuffer[ptrIdx][0]);
     ptrIdx++;
 
     buffers[bufIdx].channel_count = 2;
@@ -469,11 +478,28 @@ void StandaloneHost::clapProcess(void *pOutput, const void *pInput, uint32_t fra
     }
   }
 
+  for (uint32_t i = 0; i < midiCount; ++i)
+  {
+    clap_event_midi_t event{};
+    event.header.size = sizeof(event);
+    event.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+    event.header.type = CLAP_EVENT_MIDI;
+    event.header.time = midi[i].frame;
+    event.port_index = 0;
+    std::memcpy(event.data, midi[i].data, midi[i].size);
+    if (!pushInputEvent(&event.header))
+    {
+      services.rejectEvent();
+      break;
+    }
+  }
+
   // process() is the active bidirectional parameter transport.
   parameterFlushRequested.store(false, std::memory_order_release);
+  currentMidiOutput = &midiOutput;
   clapPlugin->_plugin->process(clapPlugin->_plugin, &process);
+  currentMidiOutput = nullptr;
   services.endAudioBlock();
-
 }
 
 bool StandaloneHost::gui_can_resize()
@@ -526,7 +552,7 @@ void StandaloneHost::serviceMainThreadRequests()
 
   if (!restartRequested.exchange(false)) return;
 
-  const bool restartAudio = rtaDac && rtaDac->isStreamRunning();
+  const bool restartAudio = audioPlayer != nullptr && services.isAudioRunning();
   if (restartAudio)
   {
     stopAudioThread();
@@ -678,6 +704,7 @@ bool StandaloneHost::tryLoadStandaloneAndPluginSettings(const fs::path &fromDir,
   const auto priorStartupRate = startSampleRate;
   const auto priorStartupInputUsed = startAudioInputUsed;
   const auto priorStartupOutputUsed = startAudioOutputUsed;
+  const auto priorFollowSystemDefaultOutput = followSystemDefaultOutput;
   const auto priorBufferSize = currentBufferSize;
   VectorOutputStream priorPluginState;
   clap_ostream_t priorStream{&priorPluginState, VectorOutputStream::write};
@@ -699,6 +726,7 @@ bool StandaloneHost::tryLoadStandaloneAndPluginSettings(const fs::path &fromDir,
   startSampleRate = priorStartupRate;
   startAudioInputUsed = priorStartupInputUsed;
   startAudioOutputUsed = priorStartupOutputUsed;
+  followSystemDefaultOutput = priorFollowSystemDefaultOutput;
   currentBufferSize = priorBufferSize;
   if (havePriorPluginState) loadPluginState(clapPlugin, priorPluginState.bytes);
   const auto restartedPriorState = restart();

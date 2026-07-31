@@ -50,6 +50,7 @@ function(target_add_clap_configuration)
                 MACOSX_BUNDLE_BUNDLE_NAME ${TCLP_OUTPUT_NAME}
                 MACOSX_BUNDLE_BUNDLE_VERSION "${TCLP_BUNDLE_VERSION}"
                 MACOSX_BUNDLE_SHORT_VERSION_STRING "${TCLP_BUNDLE_VERSION}"
+                XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "${TCLP_BUNDLE_IDENTIFIER}"
         )
 
         # Copy resource directory, if defined

@@ -12,17 +12,7 @@
 
 #include "detail/clap/fsutil.h"
 
-#ifdef __GNUC__
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wall"  // other peoples errors are outside my scope
-#endif
-
-#include "RtAudio.h"
-#include "RtMidi.h"
-
-#ifdef __GNUC__
-#pragma GCC diagnostic pop
-#endif
+#include "choc/audio/io/choc_AudioMIDIPlayer.h"
 
 #include "clap_proxy.h"
 #include "detail/shared/fixedqueue.h"
@@ -40,7 +30,16 @@ struct X11Gui;
 
 std::optional<fs::path> getStandaloneSettingsPath();
 
-struct StandaloneHost : Clap::IHost
+struct StandaloneAudioDevice
+{
+  uint64_t id{};
+  std::string backendId;
+  std::string name;
+  uint32_t inputChannels{};
+  uint32_t outputChannels{};
+};
+
+struct StandaloneHost : Clap::IHost, private choc::audio::io::AudioMIDICallback
 {
   StandaloneHost()
   {
@@ -55,7 +54,16 @@ struct StandaloneHost : Clap::IHost
   static bool oe_try_push(const struct clap_output_events *oe, const clap_event_header_t *evt)
   {
     auto *sh = static_cast<StandaloneHost *>(oe->ctx);
-    return sh != nullptr && sh->services.enqueueOutputEvent(evt);
+    if (sh == nullptr || !sh->services.enqueueOutputEvent(evt)) return false;
+    if (sh->currentMidiOutput != nullptr &&
+        evt->space_id == CLAP_CORE_EVENT_SPACE_ID &&
+        evt->type == CLAP_EVENT_MIDI && evt->size == sizeof(clap_event_midi_t))
+    {
+      const auto *midi = reinterpret_cast<const clap_event_midi_t *>(evt);
+      (*sh->currentMidiOutput)(
+          evt->time, choc::midi::MessageView(midi->data, sizeof(midi->data)));
+    }
+    return true;
   }
 
   static uint32_t ie_getsize(const struct clap_input_events *ie)
@@ -233,8 +241,7 @@ struct StandaloneHost : Clap::IHost
     TRACE;
   }
 
-  // Implementation in standalone_host_midi.cpp
-  std::vector<std::unique_ptr<RtMidiIn>> midiIns;
+  // MIDI is owned by the CHOC AudioMIDIPlayer.
   uint32_t numMidiPorts{0};
   // Kept for the existing Windows UI; the standalone-services extension owns
   // selection for new integrations.
@@ -243,39 +250,52 @@ struct StandaloneHost : Clap::IHost
   void stopMIDIThread();
   bool rebuildMIDIEndpoints();
   std::function<bool(uint32_t)> testMidiPortOpen;
-  void processMIDIEvents(double deltatime, std::vector<unsigned char> *message);
-  static void midiCallback(double deltatime, std::vector<unsigned char> *message, void *userData);
 
-  // in standalone_host.cpp
-  void clapProcess(void *pOutput, const void *pInoput, uint32_t frameCount);
+  struct DeviceMIDIEvent
+  {
+    uint32_t frame{};
+    uint8_t size{};
+    uint8_t data[3]{};
+  };
 
-  // Actual audio IO In standalone_host_audio.cpp
-  std::unique_ptr<RtAudio> rtaDac;
+  void clapProcess(
+      choc::buffer::ChannelArrayView<const float> input,
+      choc::buffer::ChannelArrayView<float> output,
+      const DeviceMIDIEvent *midi, uint32_t midiCount,
+      const choc::audio::AudioMIDIBlockDispatcher::HandleMIDIMessageFn
+          &midiOutput);
+
+  // Audio and MIDI device ownership lives behind CHOC's backend-neutral layer.
+  std::unique_ptr<choc::audio::io::AudioMIDIPlayer> audioPlayer;
   std::function<void(const std::string &)> displayAudioError{nullptr};
-  RtAudio::Api audioApi{RtAudio::Api::UNSPECIFIED};
-  std::string audioApiName{RtAudio::getApiName(RtAudio::Api::UNSPECIFIED)};
-  std::string audioApiDisplayName{RtAudio::getApiDisplayName(RtAudio::Api::UNSPECIFIED)};
-  unsigned int audioInputDeviceID{0}, audioOutputDeviceID{0};
+  std::string audioApiName;
+  std::string audioApiDisplayName;
+  uint64_t audioInputDeviceID{0}, audioOutputDeviceID{0};
   bool audioInputUsed{true}, audioOutputUsed{true};
-  int32_t currentSampleRate{0};
+  std::atomic<int32_t> currentSampleRate{0};
   uint32_t currentBufferSize{0};
   uint32_t currentInputChannels{0}, currentOutputChannels{0};
-  void guaranteeRtAudioDAC();
-  void setAudioApi(RtAudio::Api api);
-  std::tuple<unsigned int, unsigned int, int32_t> getDefaultAudioInOutSampleRate();
+  std::vector<StandaloneAudioDevice> inputAudioDevices;
+  std::vector<StandaloneAudioDevice> outputAudioDevices;
+  std::vector<std::string> midiInputDevices;
+  std::vector<std::string> midiOutputDevices;
+  bool midiSelectionConfigured{false};
+  void refreshDeviceCaches();
+  std::tuple<uint64_t, uint64_t, int32_t> getDefaultAudioInOutSampleRate();
   [[nodiscard]] bool startAudioThread();
-  [[nodiscard]] bool startAudioThreadOn(unsigned int inputDeviceID, uint32_t inputChannels,
-                                        bool useInput, unsigned int outputDeviceID,
+  [[nodiscard]] bool startAudioThreadOn(uint64_t inputDeviceID, uint32_t inputChannels,
+                                        bool useInput, uint64_t outputDeviceID,
                                         uint32_t outputChannels, bool useOutput, int32_t sampleRate);
   void stopAudioThread();
 
   bool startupAudioSet{false};
-  unsigned int startAudioIn{0}, startAudioOut{0};
+  uint64_t startAudioIn{0}, startAudioOut{0};
   uint32_t startAudioInputChannels{0}, startAudioOutputChannels{0};
   int startSampleRate{0};
   bool startAudioInputUsed{false}, startAudioOutputUsed{false};
-  void setStartupAudio(unsigned int in, uint32_t inputChannels, unsigned int out, uint32_t outputChannels,
-                       int sr, bool useInput, bool useOutput)
+  bool followSystemDefaultOutput{true};
+  void setStartupAudio(uint64_t in, uint32_t inputChannels, uint64_t out, uint32_t outputChannels,
+                       int sr, bool useInput, bool useOutput, bool followDefaultOutput)
   {
     startupAudioSet = true;
     startAudioIn = in;
@@ -285,6 +305,7 @@ struct StandaloneHost : Clap::IHost
     startSampleRate = sr;
     startAudioInputUsed = useInput;
     startAudioOutputUsed = useOutput;
+    followSystemDefaultOutput = followDefaultOutput;
   }
 
   bool activatePlugin(int32_t sr, int32_t minBlock, int32_t maxBlock);
@@ -298,14 +319,16 @@ struct StandaloneHost : Clap::IHost
   bool restoreServiceSettings(const clap_wrapper_standalone_audio_settings_t &audio,
                               const std::vector<uint64_t> &midiPorts);
 
-  std::vector<RtAudio::Api> getCompiledApi();
-  std::vector<RtAudio::DeviceInfo> getInputAudioDevices();
-  std::vector<RtAudio::DeviceInfo> getOutputAudioDevices();
+  std::vector<std::string> getCompiledApi();
+  std::vector<StandaloneAudioDevice> getInputAudioDevices();
+  std::vector<StandaloneAudioDevice> getOutputAudioDevices();
   std::vector<int32_t> getSampleRates();
   std::vector<uint32_t> getBufferSizes();
 
   clap_input_events inputEvents{};
   clap_output_events outputEvents{};
+  const choc::audio::AudioMIDIBlockDispatcher::HandleMIDIMessageFn
+      *currentMidiOutput{};
 
   std::atomic<bool> running{true}, finishedRunning{false};
 
@@ -316,5 +339,22 @@ struct StandaloneHost : Clap::IHost
   static constexpr int utilityBufferSize{4096 * 16};
   static constexpr int utilityBufferMaxChannels{64};
   float utilityBuffer[utilityBufferMaxChannels][utilityBufferSize]{};
+
+ private:
+  void sampleRateChanged(double sampleRate) override;
+  void startBlock() override;
+  void processSubBlock(const choc::audio::AudioMIDIBlockDispatcher::Block &block,
+                       bool replaceOutput) override;
+  void endBlock() override;
+
+  std::array<const float *, utilityBufferMaxChannels> deviceInputPointers{};
+  std::array<float *, utilityBufferMaxChannels> deviceOutputPointers{};
+  std::array<DeviceMIDIEvent, maxEventsPerCycle> deviceMIDIEvents{};
+  uint32_t deviceInputChannels{};
+  uint32_t deviceOutputChannels{};
+  uint32_t deviceBlockFrames{};
+  uint32_t deviceMIDIEventCount{};
+  const choc::audio::AudioMIDIBlockDispatcher::HandleMIDIMessageFn
+      *deviceMIDIOutput{};
 };
 }  // namespace freeaudio::clap_wrapper::standalone

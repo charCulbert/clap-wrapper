@@ -348,6 +348,8 @@ class AUv3ImplDetail : public Clap::IHost, public Clap::IAutomation, public os::
   // The native view (NSView on macOS, UIView on iOS) that the CLAP GUI
   // is parented to. Set by createGUIInView:.
   __weak CLAPWRAP_ViewClass *_guiParentView = nil;
+  uint32_t _selectedViewWidth = 0;
+  uint32_t _selectedViewHeight = 0;
 
   // The view controller that owns the GUI — needed for gui_request_resize
   // to set preferredContentSize (the only legal AUv3 host communication path).
@@ -1593,7 +1595,7 @@ static Clap::Library _library;
   return @[];
 }
 
-- (MIDIProtocolID)AudioUnitMIDIProtocol
+- (MIDIProtocolID)audioUnitMIDIProtocol
 {
   return _impl && _impl->_supportsMIDI2 ? kMIDIProtocol_2_0 : kMIDIProtocol_1_0;
 }
@@ -1663,6 +1665,27 @@ static Clap::Library _library;
       (viewConfiguration.width < minimumWidth || viewConfiguration.height < minimumHeight))
     return;
 #endif
+
+  const uint32_t width = static_cast<uint32_t>(viewConfiguration.width);
+  const uint32_t height = static_cast<uint32_t>(viewConfiguration.height);
+  if (width == 0 || height == 0) return;
+
+  _impl->_selectedViewWidth = width;
+  _impl->_selectedViewHeight = height;
+
+  if (_impl->_guiParentView)
+  {
+    __weak ClapAUv3AudioUnit *weakSelf = self;
+    void (^applySize)(void) = ^{
+      __strong ClapAUv3AudioUnit *audioUnit = weakSelf;
+      if (audioUnit && [audioUnit setGUISize:width height:height])
+        [audioUnit _applyGUISizeWidth:width height:height];
+    };
+    if ([NSThread isMainThread])
+      applySize();
+    else
+      dispatch_async(dispatch_get_main_queue(), applySize);
+  }
 }
 
 - (BOOL)_isInactiveForStateChange
@@ -1698,7 +1721,7 @@ static Clap::Library _library;
 
 - (void)setCurrentPreset:(AUAudioUnitPreset *)preset
 {
-  if (!preset || ![self _isInactiveForStateChange]) return;
+  if (!preset) return;
 
   if (preset.number >= 0)
   {
@@ -1720,14 +1743,29 @@ static Clap::Library _library;
   }
   else
   {
+    if (![self _isInactiveForStateChange]) return;
+    AUAudioUnitPreset *savedPreset = nil;
+    for (AUAudioUnitPreset *candidate in [super userPresets])
+    {
+      const BOOL namesMatch =
+          (!candidate.name && !preset.name) || [candidate.name isEqualToString:preset.name];
+      if (candidate.number == preset.number && namesMatch)
+      {
+        savedPreset = candidate;
+        break;
+      }
+    }
+    if (!savedPreset) return;
+
     NSError *error = nil;
-    NSDictionary<NSString *, id> *state = [super presetStateFor:preset error:&error];
+    NSDictionary<NSString *, id> *state = [super presetStateFor:savedPreset error:&error];
     if (!state) return;
     [self setFullState:state];
   }
 
   [self willChangeValueForKey:@"currentPreset"];
-  _currentPreset = [preset copy];
+  // AUAudioUnitPreset is not copyable; the strong ivar retains this instance.
+  _currentPreset = preset;
   [self didChangeValueForKey:@"currentPreset"];
 }
 
@@ -2282,6 +2320,13 @@ static Clap::Library _library;
   uint32_t w = 0, h = 0;
   gui->get_size(plugin, &w, &h);
 
+  if (_impl->_selectedViewWidth > 0 && _impl->_selectedViewHeight > 0 &&
+      gui->can_resize(plugin))
+  {
+    w = _impl->_selectedViewWidth;
+    h = _impl->_selectedViewHeight;
+  }
+
   if (gui->can_resize(plugin))
   {
     gui->adjust_size(plugin, &w, &h);
@@ -2523,6 +2568,34 @@ static Clap::Library _library;
   BOOL _guiCreated;
 }
 
+- (CGSize)initialViewSize
+{
+  return CGSizeMake(400, 500);
+}
+
+- (void)_applyInitialViewConfiguration
+{
+  if (![NSThread isMainThread])
+  {
+    __weak ClapAUv3ViewController *weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+      [weakSelf _applyInitialViewConfiguration];
+    });
+    return;
+  }
+
+#if defined(CLAP_WRAPPER_HAS_CHARDIO_AUV3_METADATA)
+  uint32_t policy = 0, width = 0, height = 0;
+  if (![self.audioUnit getViewPolicy:&policy minimumWidth:&width minimumHeight:&height] ||
+      policy == CHARDIO_AUV3_VIEW_POLICY_HOST_DEFAULT || width == 0 || height == 0)
+    return;
+
+  CGSize size = CGSizeMake(width, height);
+  self.view.frame = CGRectMake(0, 0, size.width, size.height);
+  self.preferredContentSize = size;
+#endif
+}
+
 - (void)loadView
 {
   // Custom container view that detects when the view enters a window via
@@ -2533,13 +2606,14 @@ static Clap::Library _library;
   // Start with a reasonable default size. The viewbridge rejects
   // zero-sized views. The real size is set in _createPluginGUI once the
   // CLAP plugin reports its preferred dimensions.
-  CGSize initialSize = CGSizeMake(400, 500);
+  CGSize initialSize = [self initialViewSize];
   ClapAUv3ContainerView *view = [[ClapAUv3ContainerView alloc]
       initWithFrame:CGRectMake(0, 0, initialSize.width, initialSize.height)];
   view.viewController = self;
   view.translatesAutoresizingMaskIntoConstraints = YES;
   [self setView:view];
   self.preferredContentSize = initialSize;
+  [self _applyInitialViewConfiguration];
 }
 
 - (void)setAudioUnit:(ClapAUv3AudioUnit *)audioUnit
@@ -2548,6 +2622,12 @@ static Clap::Library _library;
   // Establish the back-reference so the AU can return us from
   // requestViewControllerWithCompletionHandler:
   if (audioUnit) audioUnit->_factoryViewController = self;
+  if (audioUnit)
+  {
+    dispatch_async(dispatch_get_main_queue(), ^{
+      if (self.isViewLoaded && !self->_guiCreated) [self _applyInitialViewConfiguration];
+    });
+  }
 }
 
 - (void)_createPluginGUI
@@ -2574,15 +2654,14 @@ static Clap::Library _library;
   }
 }
 
-// Convergence point for GUI creation. Called from multiple triggers:
-// - viewDidMoveToWindow / viewDidMoveToSuperview (in-process)
-// - viewDidAppear (out-of-process)
-// Creates the GUI once all preconditions are met. Guarded by _guiCreated.
+// Convergence point for GUI creation. Create as soon as the view is loaded so
+// preferredContentSize contains the CLAP GUI size before the host chooses its
+// editor window size. Some hosts ignore later preferred-size changes.
 - (void)_tryCreateGUI
 {
   if (_guiCreated) return;
   if (!self.audioUnit) return;
-  if (!self.isViewLoaded || !self.view.window) return;
+  if (!self.isViewLoaded) return;
 
   _guiCreated = YES;
   [self _createPluginGUI];
@@ -2610,11 +2689,8 @@ static Clap::Library _library;
 - (void)viewDidLoad
 {
   [super viewDidLoad];
-  // Try to create the GUI early so preferredContentSize is set BEFORE
-  // the host reads it via requestViewControllerWithCompletionHandler:.
-  // For out-of-process AUv3, the proxy doesn't forward property changes,
-  // so the host only sees the value that was set at VC creation time.
-  // If gui->create() blocks (JUCE plugins), viewDidAppear handles it later.
+  // Set the real preferred size before returning the view controller to the
+  // host. The parent view exists here even though it is not in a window yet.
   [self _tryCreateGUI];
 }
 

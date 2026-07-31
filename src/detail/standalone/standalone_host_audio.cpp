@@ -1,318 +1,251 @@
-
-
-#ifdef __GNUC__
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wall"  // other peoples errors are outside my scope
-#endif
-
-//#define MINIAUDIO_IMPLEMENTATION
-//#include "miniaudio.h"
-#include "RtAudio.h"
-
-#ifdef __GNUC__
-#pragma GCC diagnostic pop
-#endif
-
 #include "standalone_host.h"
 #include "entry.h"
 
+#include "choc/audio/io/choc_RtAudioPlayer.h"
+
+#include <algorithm>
+#include <chrono>
+#include <limits>
+
 namespace freeaudio::clap_wrapper::standalone
 {
-int rtaCallback(void *outputBuffer, void *inputBuffer, unsigned int nBufferFrames,
-                double /* streamTime */, RtAudioStreamStatus status, void *data)
+namespace
 {
-  if (status)
-  {
-  }
-  auto sh = (StandaloneHost *)data;
-  sh->clapProcess(outputBuffer, inputBuffer, nBufferFrames);
+constexpr uint32_t minimumSampleRate = 22050;
+constexpr uint32_t maximumSampleRate = 192000;
 
-  return 0;
+struct SampleAccurateRtAudioMIDIPlayer final
+    : choc::audio::io::RtAudioMIDIPlayer
+{
+  SampleAccurateRtAudioMIDIPlayer(
+      const choc::audio::io::AudioDeviceOptions &options,
+      std::function<void(const std::string &)> log)
+      : RtAudioMIDIPlayer(options, std::move(log))
+  {
+    dispatcher.midiTimingGranularityFrames = 1;
+  }
+};
+
+uint64_t deviceId(const std::string &backendId)
+{
+  uint64_t hash = 1469598103934665603ull;
+  for (const auto byte : backendId)
+  {
+    hash ^= static_cast<unsigned char>(byte);
+    hash *= 1099511628211ull;
+  }
+  return hash == 0 ? 1 : hash;
 }
 
-void rtaErrorCallback(RtAudioErrorType errorType, const std::string &errorText)
+const StandaloneAudioDevice *findDevice(
+    const std::vector<StandaloneAudioDevice> &devices, uint64_t id)
 {
-  if (errorType != RTAUDIO_OUTPUT_UNDERFLOW && errorType != RTAUDIO_INPUT_OVERFLOW)
-  {
-    LOGINFO("[ERROR] RtAudio reports '{}' [{}]", errorText, (int)errorType);
-    auto ae = getStandaloneHost()->displayAudioError;
-    if (ae)
-    {
-      ae(errorText);
-    }
-  }
-  else
-  {
-    static bool reported = false;
-    if (!reported)
-    {
-      LOGINFO("[ERROR] RtAudio reports under/overflow '{}' [{}]", errorText, (int)errorType);
-      reported = true;
-    }
-  }
+  const auto found = std::find_if(
+      devices.begin(), devices.end(),
+      [id](const auto &device) { return device.id == id; });
+  return found == devices.end() ? nullptr : &*found;
 }
 
-void StandaloneHost::guaranteeRtAudioDAC()
+std::vector<StandaloneAudioDevice> makeDevices(
+    const std::vector<choc::audio::io::AudioDeviceInfo> &devices,
+    uint32_t inputChannels, uint32_t outputChannels)
 {
-  if (!rtaDac)
-  {
-    LOGDETAIL("Creating Standalone RtAudioDAC");
-    setAudioApi(RtAudio::Api::UNSPECIFIED);
-  }
+  std::vector<StandaloneAudioDevice> result;
+  result.reserve(devices.size());
+  for (const auto &device : devices)
+    result.push_back(
+        {deviceId(device.deviceID), device.deviceID, device.name,
+         inputChannels, outputChannels});
+  return result;
+}
+} // namespace
+
+void StandaloneHost::refreshDeviceCaches()
+{
+  if (!audioPlayer) return;
+
+  inputAudioDevices = makeDevices(
+      audioPlayer->getAvailableInputDevices(),
+      std::min<uint32_t>(2, std::max<uint32_t>(1, totalInputChannels)), 0);
+  outputAudioDevices = makeDevices(
+      audioPlayer->getAvailableOutputDevices(), 0,
+      std::min<uint32_t>(2, std::max<uint32_t>(1, totalOutputChannels)));
+  midiInputDevices = audioPlayer->getAvailableMIDIInputDevices();
+  midiOutputDevices = audioPlayer->getAvailableMIDIOutputDevices();
+  numMidiPorts = static_cast<uint32_t>(midiInputDevices.size());
 }
 
-void StandaloneHost::setAudioApi(RtAudio::Api api)
+std::tuple<uint64_t, uint64_t, int32_t>
+StandaloneHost::getDefaultAudioInOutSampleRate()
 {
-  rtaDac = std::make_unique<RtAudio>(api, &rtaErrorCallback);
-  audioApi = api;
-  audioApiName = rtaDac->getApiName(api);
-  audioApiDisplayName = rtaDac->getApiDisplayName(api);
-  rtaDac->showWarnings(true);
+  refreshDeviceCaches();
+  const auto sampleRate = currentSampleRate.load(std::memory_order_acquire);
+  return {audioInputDeviceID, audioOutputDeviceID,
+          sampleRate > 0 ? sampleRate : 48000};
 }
 
-std::tuple<unsigned int, unsigned int, int32_t> StandaloneHost::getDefaultAudioInOutSampleRate()
-{
-  guaranteeRtAudioDAC();
-  auto iid = rtaDac->getDefaultInputDevice();
-  auto oid = rtaDac->getDefaultOutputDevice();
-  auto outInfo = rtaDac->getDeviceInfo(oid);
-  auto sr = outInfo.currentSampleRate;
-  if (sr < 1)
-  {
-    sr = outInfo.preferredSampleRate;
-  }
-
-  return {iid, oid, (int32_t)sr};
-}
 bool StandaloneHost::startAudioThread()
 {
-  guaranteeRtAudioDAC();
-
-  if (startupAudioSet)
-  {
-    auto in = startAudioIn;
-    auto out = startAudioOut;
-    auto sr = startSampleRate;
-    return startAudioThreadOn(in, startAudioInputChannels, startAudioInputUsed && numAudioInputs > 0, out,
-                              startAudioOutputChannels,
-                              startAudioOutputUsed && numAudioOutputs > 0, sr);
-  }
-
-  auto [in, out, sr] = getDefaultAudioInOutSampleRate();
-  return startAudioThreadOn(in, 2, numAudioInputs > 0, out, 2, numAudioOutputs > 0, sr);
+  const auto input = startupAudioSet ? startAudioIn : uint64_t{};
+  const auto output = startupAudioSet ? startAudioOut : uint64_t{};
+  const auto sampleRate = startupAudioSet ? startSampleRate : 48000;
+  return startAudioThreadOn(
+      input, startupAudioSet ? startAudioInputChannels : 2,
+      (startupAudioSet ? startAudioInputUsed : true) && numAudioInputs > 0,
+      output, startupAudioSet ? startAudioOutputChannels : 2,
+      (startupAudioSet ? startAudioOutputUsed : true) && numAudioOutputs > 0,
+      sampleRate);
 }
 
-std::vector<RtAudio::DeviceInfo> filterDevicesBy(const std::unique_ptr<RtAudio> &rtaDac,
-                                                 std::function<bool(const RtAudio::DeviceInfo &)> f)
+std::vector<std::string> StandaloneHost::getCompiledApi()
 {
-  std::vector<RtAudio::DeviceInfo> res;
-  auto dids = rtaDac->getDeviceIds();
-  auto dnms = rtaDac->getDeviceNames();
-  for (auto d : dids)
-  {
-    auto inf = rtaDac->getDeviceInfo(d);
-    if (f(inf))
-    {
-      res.push_back(inf);
-    }
-  }
-  return res;
+  return audioPlayer ? audioPlayer->getAvailableAudioAPIs()
+                     : std::vector<std::string>{};
 }
 
-std::vector<RtAudio::Api> StandaloneHost::getCompiledApi()
+std::vector<StandaloneAudioDevice> StandaloneHost::getInputAudioDevices()
 {
-  guaranteeRtAudioDAC();
-
-  std::vector<RtAudio::Api> compiledApi;
-  rtaDac->getCompiledApi(compiledApi);
-
-  return compiledApi;
+  refreshDeviceCaches();
+  return inputAudioDevices;
 }
 
-std::vector<RtAudio::DeviceInfo> StandaloneHost::getInputAudioDevices()
+std::vector<StandaloneAudioDevice> StandaloneHost::getOutputAudioDevices()
 {
-  guaranteeRtAudioDAC();
-  return filterDevicesBy(rtaDac, [](auto &a) { return a.inputChannels > 0; });
-}
-
-std::vector<RtAudio::DeviceInfo> StandaloneHost::getOutputAudioDevices()
-{
-  guaranteeRtAudioDAC();
-  return filterDevicesBy(rtaDac, [](auto &a) { return a.outputChannels > 0; });
+  refreshDeviceCaches();
+  return outputAudioDevices;
 }
 
 std::vector<int32_t> StandaloneHost::getSampleRates()
 {
-  guaranteeRtAudioDAC();
+  std::vector<int32_t> result;
+  if (!audioPlayer) return result;
 
-  std::vector<int32_t> res;
-
-  auto samplesRates{rtaDac->getDeviceInfo(audioInputDeviceID).sampleRates};
-
-  for (auto &sampleRate : rtaDac->getDeviceInfo(audioInputDeviceID).sampleRates)
-  {
-    res.push_back(sampleRate);
-  }
-
-  return res;
+  for (const auto sampleRate : audioPlayer->getAvailableSampleRates())
+    if (sampleRate >= minimumSampleRate && sampleRate <= maximumSampleRate)
+      result.push_back(static_cast<int32_t>(sampleRate));
+  return result;
 }
 
 std::vector<uint32_t> StandaloneHost::getBufferSizes()
 {
-  guaranteeRtAudioDAC();
-
-  std::vector<uint32_t> res{16,  32,  48,  64,  96,  128,  144,  160,
-                            192, 224, 256, 480, 512, 1024, 2048, 4096};
-  return res;
+  return audioPlayer ? audioPlayer->getAvailableBlockSizes()
+                     : std::vector<uint32_t>{16, 32, 48, 64, 96, 128, 196,
+                                             224, 256, 320, 480, 512, 768,
+                                             1024, 1536, 2048};
 }
 
-bool StandaloneHost::startAudioThreadOn(unsigned int inputDeviceID, uint32_t inputChannels,
-                                        bool useInput, unsigned int outputDeviceID,
-                                        uint32_t outputChannels, bool useOutput,
-                                        int32_t reqSampleRate)
+bool StandaloneHost::startAudioThreadOn(
+    uint64_t inputDeviceID, uint32_t inputChannels, bool useInput,
+    uint64_t outputDeviceID, uint32_t outputChannels, bool useOutput,
+    int32_t requestedSampleRate)
 {
-  guaranteeRtAudioDAC();
-
-  if (rtaDac->isStreamRunning())
-    stopAudioThread();
+  stopAudioThread();
   running.store(false, std::memory_order_release);
 
-  audioInputDeviceID = inputDeviceID;
-  audioInputUsed = useInput;
-  audioOutputDeviceID = outputDeviceID;
-  audioOutputUsed = useOutput;
-  currentInputChannels = 0;
-  currentOutputChannels = 0;
+  const auto *input = findDevice(inputAudioDevices, inputDeviceID);
+  const auto *output = findDevice(outputAudioDevices, outputDeviceID);
 
-  auto dids = rtaDac->getDeviceIds();
-  auto dnms = rtaDac->getDeviceNames();
+  choc::audio::io::AudioDeviceOptions options;
+  options.sampleRate = static_cast<uint32_t>(
+      std::clamp<int32_t>(requestedSampleRate, minimumSampleRate,
+                          maximumSampleRate));
+  options.blockSize = currentBufferSize == 0 ? 256 : currentBufferSize;
+  options.inputChannelCount = useInput ? inputChannels : 0;
+  options.outputChannelCount = useOutput ? outputChannels : 0;
+  options.audioAPI = audioApiDisplayName;
+  options.inputDeviceID = input != nullptr ? input->backendId : std::string{};
+  options.outputDeviceID =
+      followSystemDefaultOutput || output == nullptr
+          ? std::string{}
+          : output->backendId;
+  options.midiClientName = "CLAP Wrapper";
 
-  RtAudio::StreamParameters oParams;
-  int32_t sampleRate{reqSampleRate};
-
-  if (useOutput)
+  const auto selectedMidi = services.selectedMidiPortIds();
+  const auto selectedMidiNames = [this, &selectedMidi]
   {
-    oParams.deviceId = outputDeviceID;
-    auto outInfo = rtaDac->getDeviceInfo(oParams.deviceId);
-    oParams.nChannels = std::min(outputChannels, outInfo.outputChannels);
-    oParams.firstChannel = 0;
-    if (sampleRate < 0)
-    {
-      sampleRate = outInfo.preferredSampleRate;
-    }
-    else
-    {
-      // Mkae sure this sample rate is available
-      bool isPossible{false};
-      for (auto sr : outInfo.sampleRates)
+    std::vector<std::string> names;
+    for (const auto id : selectedMidi)
+      if (id > 0 && id <= midiInputDevices.size())
+        names.push_back(midiInputDevices[static_cast<std::size_t>(id - 1)]);
+    return names;
+  }();
+  options.shouldOpenMIDIInput =
+      [all = !midiSelectionConfigured, selectedMidiNames](
+          const std::string &name)
+  {
+    return all || std::find(selectedMidiNames.begin(), selectedMidiNames.end(),
+                            name) != selectedMidiNames.end();
+  };
+  options.shouldOpenMIDIOutput = [](const std::string &) { return false; };
+
+  auto candidate = std::make_unique<SampleAccurateRtAudioMIDIPlayer>(
+      options, [](const std::string &message)
       {
-        isPossible = isPossible || ((int)sr == (int)sampleRate);
-      }
-      if (!isPossible)
-      {
-        sampleRate = outInfo.preferredSampleRate;
-      }
-    }
-  }
-
-  RtAudio::StreamParameters iParams;
-  if (useInput)
+        LOGDETAIL("CHOC audio: {}", message);
+      });
+  if (const auto error = candidate->getLastError(); !error.empty())
   {
-    iParams.deviceId = inputDeviceID;
-    auto inInfo = rtaDac->getDeviceInfo(iParams.deviceId);
-    iParams.nChannels = std::min(inputChannels, inInfo.inputChannels);
-    iParams.firstChannel = 0;
-    if (sampleRate < 0) sampleRate = inInfo.preferredSampleRate;
-  }
-
-  if (sampleRate < 0)
-  {
-    LOGINFO("[WARNING] No preferred sample rate detected; using 48k");
-    sampleRate = 48000;
-  }
-
-  currentSampleRate = sampleRate;
-
-  RtAudio::StreamOptions options;
-  options.flags = RTAUDIO_SCHEDULE_REALTIME | RTAUDIO_NONINTERLEAVED;
-
-  /*
-   * RTAudio doesn't tell you what the possible frame sizes are but instead
-   * just tells you to try open stream with power of twos you want. So leave
-   * this for now at 256 and return to it shortly.
-   */
-  LOGINFO("[WARNING] Hardcoding frame size to 256 samples for now");
-
-  if (currentBufferSize == 0)
-  {
-    currentBufferSize = 256;
-  }
-
-  if (rtaDac->openStream((useOutput) ? &oParams : nullptr, (useInput) ? &iParams : nullptr,
-                         RTAUDIO_FLOAT32, sampleRate, &currentBufferSize, &rtaCallback, (void *)this,
-                         &options))
-  {
-    LOGINFO("[ERROR] Error opening rta stream '{}'", rtaDac->getErrorText());
-    deactivatePlugin();
-    rtaDac->closeStream();
+    LOGINFO("[ERROR] CHOC audio reports '{}'", error);
+    if (displayAudioError) displayAudioError(error);
     return false;
   }
 
-  if (!activatePlugin(sampleRate, 1, currentBufferSize * 2))
-  {
-    LOGINFO("[ERROR] Plugin activation failed");
-    running.store(false, std::memory_order_release);
-    rtaDac->closeStream();
-    return false;
-  }
+  audioPlayer = std::move(candidate);
+  refreshDeviceCaches();
 
-  LOGDETAIL("RtAudio Attached Devices");
-  if (useOutput)
-  {
-    for (auto i = 0U; i < dids.size(); ++i)
-    {
-      if (oParams.deviceId == dids[i]) LOGDETAIL("  - Output : '{}'", dnms[i]);
-    }
-    currentOutputChannels = oParams.nChannels;
-    LOGDETAIL("RtAudio Output Stream Channels {}", oParams.nChannels);
-  }
-  if (useInput)
-  {
-    for (auto i = 0U; i < dids.size(); ++i)
-    {
-      if (iParams.deviceId == dids[i]) LOGDETAIL("  - Input : '{}'", dnms[i]);
-    }
-    currentInputChannels = iParams.nChannels;
-    LOGDETAIL("RtAudio Input Stream Channels {}", iParams.nChannels);
-  }
+  const auto &actual = audioPlayer->options;
+  audioApiName = actual.audioAPI;
+  audioApiDisplayName = actual.audioAPI;
+  currentBufferSize = actual.blockSize;
+  currentInputChannels = actual.inputChannelCount;
+  currentOutputChannels = actual.outputChannelCount;
+  audioInputUsed = actual.inputChannelCount != 0;
+  audioOutputUsed = actual.outputChannelCount != 0;
+
+  if (const auto device = std::find_if(
+          inputAudioDevices.begin(), inputAudioDevices.end(),
+          [&actual](const auto &candidateDevice)
+          {
+            return candidateDevice.backendId == actual.inputDeviceID;
+          });
+      device != inputAudioDevices.end())
+    audioInputDeviceID = device->id;
+  else
+    audioInputDeviceID = 0;
+
+  if (const auto device = std::find_if(
+          outputAudioDevices.begin(), outputAudioDevices.end(),
+          [&actual](const auto &candidateDevice)
+          {
+            return candidateDevice.backendId == actual.outputDeviceID;
+          });
+      device != outputAudioDevices.end())
+    audioOutputDeviceID = device->id;
+  else
+    audioOutputDeviceID = 0;
 
   clap_wrapper_standalone_audio_settings_t currentSettings{};
   currentSettings.struct_size = sizeof(currentSettings);
-  currentSettings.input_device_id = useInput ? inputDeviceID : 0;
-  currentSettings.output_device_id = useOutput ? outputDeviceID : 0;
-  currentSettings.input_channels = useInput ? currentInputChannels : 0;
-  currentSettings.output_channels = useOutput ? currentOutputChannels : 0;
-  currentSettings.sample_rate = static_cast<uint32_t>(sampleRate);
-  currentSettings.buffer_size = currentBufferSize;
-  if (useInput) currentSettings.flags |= CLAP_WRAPPER_STANDALONE_AUDIO_INPUT_ENABLED;
-  if (useOutput) currentSettings.flags |= CLAP_WRAPPER_STANDALONE_AUDIO_OUTPUT_ENABLED;
+  currentSettings.input_device_id = audioInputDeviceID;
+  currentSettings.output_device_id = audioOutputDeviceID;
+  currentSettings.input_channels = currentInputChannels;
+  currentSettings.output_channels = currentOutputChannels;
+  currentSettings.sample_rate = actual.sampleRate;
+  currentSettings.buffer_size = actual.blockSize;
+  if (audioInputUsed)
+    currentSettings.flags |= CLAP_WRAPPER_STANDALONE_AUDIO_INPUT_ENABLED;
+  if (audioOutputUsed)
+    currentSettings.flags |= CLAP_WRAPPER_STANDALONE_AUDIO_OUTPUT_ENABLED;
+  if (audioOutputUsed && followSystemDefaultOutput)
+    currentSettings.flags |=
+        CLAP_WRAPPER_STANDALONE_AUDIO_FOLLOW_DEFAULT_OUTPUT;
   services.recordAudioSettings(currentSettings);
 
-  if (!rtaDac->isStreamOpen())
+  audioPlayer->addCallback(*this);
+  if (!isActive.load(std::memory_order_acquire))
   {
-    LOGINFO("[ERROR] Stream failed to open :  {}", rtaDac->getErrorText());
-    running.store(false, std::memory_order_release);
-    deactivatePlugin();
-    rtaDac->closeStream();
-    return false;
-  }
-
-  if (rtaDac->startStream())
-  {
-    LOGINFO("[ERROR] startStream failed : {}", rtaDac->getErrorText());
-    running.store(false, std::memory_order_release);
-    deactivatePlugin();
-    rtaDac->closeStream();
+    audioPlayer->removeCallback(*this);
+    audioPlayer.reset();
     return false;
   }
 
@@ -324,36 +257,87 @@ bool StandaloneHost::startAudioThreadOn(unsigned int inputDeviceID, uint32_t inp
 
 void StandaloneHost::stopAudioThread()
 {
-  LOGINFO("Shutting down audio");
-  if (!rtaDac)
-  {
-    services.resetAudioClock();
-    return;
-  }
-
   services.setAudioRunning(false);
-
-  if (!rtaDac->isStreamRunning())
+  running.store(false, std::memory_order_release);
+  if (audioPlayer)
   {
+    audioPlayer->removeCallback(*this);
+    audioPlayer.reset();
   }
-  else
-  {
-    running = false;
-
-    // bit of a hack. Wait until we get an ack from audio callback
-    for (auto i = 0; i < 10000 && !finishedRunning; ++i)
-    {
-      using namespace std::chrono_literals;
-      std::this_thread::sleep_for(1ms);
-    }
-
-    if (rtaDac && rtaDac->isStreamRunning())
-    {
-      rtaDac->stopStream();
-      rtaDac->closeStream();
-    }
-  }
+  deactivatePlugin();
   services.resetAudioClock();
-  return;
+  finishedRunning.store(true, std::memory_order_release);
 }
-}  // namespace freeaudio::clap_wrapper::standalone
+
+void StandaloneHost::sampleRateChanged(double sampleRate)
+{
+  if (sampleRate < minimumSampleRate || sampleRate > maximumSampleRate)
+    return;
+
+  currentSampleRate.store(static_cast<int32_t>(sampleRate),
+                          std::memory_order_release);
+  const auto maximumFrames =
+      std::max<uint32_t>(1, currentBufferSize) * 2;
+  if (!activatePlugin(static_cast<int32_t>(sampleRate), 1, maximumFrames))
+    running.store(false, std::memory_order_release);
+}
+
+void StandaloneHost::startBlock()
+{
+  deviceInputChannels = 0;
+  deviceOutputChannels = 0;
+  deviceBlockFrames = 0;
+  deviceMIDIEventCount = 0;
+  deviceMIDIOutput = nullptr;
+}
+
+void StandaloneHost::processSubBlock(
+    const choc::audio::AudioMIDIBlockDispatcher::Block &block,
+    bool replaceOutput)
+{
+  (void)replaceOutput;
+
+  if (deviceBlockFrames == 0)
+  {
+    deviceInputChannels = std::min<uint32_t>(
+        block.audioInput.getNumChannels(),
+        static_cast<uint32_t>(deviceInputPointers.size()));
+    deviceOutputChannels = std::min<uint32_t>(
+        block.audioOutput.getNumChannels(),
+        static_cast<uint32_t>(deviceOutputPointers.size()));
+    for (uint32_t channel = 0; channel < deviceInputChannels; ++channel)
+      deviceInputPointers[channel] =
+          block.audioInput.getIterator(channel).sample;
+    for (uint32_t channel = 0; channel < deviceOutputChannels; ++channel)
+      deviceOutputPointers[channel] =
+          block.audioOutput.getIterator(channel).sample;
+    deviceMIDIOutput = &block.onMidiOutputMessage;
+  }
+
+  for (const auto &message : block.midiMessages)
+  {
+    if (message.message.size() == 0 || message.message.size() > 3 ||
+        deviceMIDIEventCount >= deviceMIDIEvents.size())
+      continue;
+
+    auto &event = deviceMIDIEvents[deviceMIDIEventCount++];
+    event.frame = deviceBlockFrames;
+    event.size = static_cast<uint8_t>(message.message.size());
+    std::memcpy(event.data, message.message.data(), event.size);
+  }
+  deviceBlockFrames += block.audioOutput.getNumFrames();
+}
+
+void StandaloneHost::endBlock()
+{
+  if (deviceMIDIOutput == nullptr || deviceBlockFrames == 0) return;
+
+  clapProcess(
+      choc::buffer::createChannelArrayView(
+          deviceInputPointers.data(), deviceInputChannels, deviceBlockFrames),
+      choc::buffer::createChannelArrayView(
+          deviceOutputPointers.data(), deviceOutputChannels,
+          deviceBlockFrames),
+      deviceMIDIEvents.data(), deviceMIDIEventCount, *deviceMIDIOutput);
+}
+} // namespace freeaudio::clap_wrapper::standalone

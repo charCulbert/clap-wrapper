@@ -17,7 +17,7 @@ std::shared_ptr<Clap::Plugin> mainCreatePlugin(const clap_plugin_entry *ee, cons
   entry = ee;
   LOGINFO("Standalone starting : {}", argv[0]);
 
-  LOGINFO("CLAP Version : {}.{}.{}", entry->clap_version.major, entry->clap_version.major,
+  LOGINFO("CLAP Version : {}.{}.{}", entry->clap_version.major, entry->clap_version.minor,
           entry->clap_version.revision);
 
   entry->init(argv[0]);

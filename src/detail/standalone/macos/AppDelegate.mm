@@ -1,6 +1,7 @@
 #import "AppDelegate.h"
 
 #include <AVFoundation/AVFoundation.h>
+#include <CoreAudio/CoreAudio.h>
 
 #include <algorithm>
 #include <map>
@@ -13,7 +14,19 @@
 
 #include "detail/clap/fsutil.h"
 
+namespace
+{
+constexpr uint32_t minimumSampleRate = 22050;
+constexpr uint32_t maximumSampleRate = 192000;
+}
+
 @interface ClapWrapperAppDelegate ()
+
+@property(copy) AudioObjectPropertyListenerBlock defaultOutputDeviceListener;
+
+- (void)installDefaultOutputDeviceListener;
+- (void)removeDefaultOutputDeviceListener;
+- (void)defaultOutputDeviceChanged;
 
 @end
 
@@ -27,12 +40,16 @@
   std::vector<uint64_t> selectedMidiPortIds;
   std::vector<NSButton *> midiPortButtons;
   clap_wrapper_standalone_audio_settings_t selectedAudio;
+  NSTextField *statusLabel;
 }
 
 - (void)setupContents;
 - (BOOL)loadServiceSnapshots;
 - (void)resetSampleRateSelection;
 - (void)resetChannelSelections;
+- (NSInteger)selectedOutputDeviceIndex;
+- (void)applySelections;
+- (void)onSelectionChanged:(id)sender;
 - (void)showConfigurationFailure:(NSString *)message restored:(BOOL)restored;
 
 @end
@@ -215,10 +232,16 @@
   };
 
   if (!freeaudio::clap_wrapper::standalone::mainStartAudio()) NSLog(@"Standalone audio startup failed");
+  [self installDefaultOutputDeviceListener];
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)aNotification
 {
+  for (NSString *title in @[ @"File", @"Window" ])
+  {
+    if (auto *item = [[NSApp mainMenu] itemWithTitle:title])
+      [[NSApp mainMenu] removeItem:item];
+  }
   [NSApp activateIgnoringOtherApps:YES];
   [NSTimer scheduledTimerWithTimeInterval:0.001
                                    target:self
@@ -235,6 +258,7 @@
 - (void)applicationWillTerminate:(NSNotification *)aNotification
 {
   LOGDETAIL("Application terminating");
+  [self removeDefaultOutputDeviceListener];
   freeaudio::clap_wrapper::standalone::getStandaloneHost()->displayAudioError = nullptr;
   freeaudio::clap_wrapper::standalone::getStandaloneHost()->onRequestResize = nullptr;
 
@@ -250,6 +274,56 @@
   self.requestCallbackTimer = nil;
 
   freeaudio::clap_wrapper::standalone::mainFinish();
+}
+
+- (void)installDefaultOutputDeviceListener
+{
+  if (self.defaultOutputDeviceListener != nil) return;
+  const AudioObjectPropertyAddress address{
+      kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyScopeGlobal,
+      kAudioObjectPropertyElementMain};
+  self.defaultOutputDeviceListener =
+      ^(UInt32, const AudioObjectPropertyAddress *) {
+        auto *delegate = (ClapWrapperAppDelegate *)[NSApp delegate];
+        [delegate defaultOutputDeviceChanged];
+      };
+  const auto status = AudioObjectAddPropertyListenerBlock(
+      kAudioObjectSystemObject, &address, dispatch_get_main_queue(),
+      self.defaultOutputDeviceListener);
+  if (status != noErr)
+  {
+    LOGINFO("[ERROR] Unable to observe the macOS default output device ({})", status);
+    self.defaultOutputDeviceListener = nil;
+  }
+}
+
+- (void)removeDefaultOutputDeviceListener
+{
+  if (self.defaultOutputDeviceListener == nil) return;
+  const AudioObjectPropertyAddress address{
+      kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyScopeGlobal,
+      kAudioObjectPropertyElementMain};
+  AudioObjectRemovePropertyListenerBlock(
+      kAudioObjectSystemObject, &address, dispatch_get_main_queue(),
+      self.defaultOutputDeviceListener);
+  self.defaultOutputDeviceListener = nil;
+}
+
+- (void)defaultOutputDeviceChanged
+{
+  auto *standaloneHost = freeaudio::clap_wrapper::standalone::getStandaloneHost();
+  if (!standaloneHost->followSystemDefaultOutput || !standaloneHost->startAudioOutputUsed) return;
+
+  standaloneHost->stopAudioThread();
+  standaloneHost->stopMIDIThread();
+  standaloneHost->deactivatePlugin();
+  standaloneHost->refreshAudioServiceSnapshot();
+  standaloneHost->refreshMidiServiceSnapshot();
+  if (!standaloneHost->rebuildMIDIEndpoints() || !standaloneHost->startAudioThread())
+  {
+    const std::string message{"Unable to use the new macOS default output device."};
+    if (standaloneHost->displayAudioError) standaloneHost->displayAudioError(message);
+  }
 }
 
 - (IBAction)openAudioSettingsWindow:(id)sender
@@ -322,65 +396,6 @@
   return frameSize;
 }
 
-- (IBAction)streamWrapperFileAs:(id)sender
-{
-  NSSavePanel *savePanel = [NSSavePanel savePanel];
-  [savePanel setNameFieldStringValue:@"Untitled"];  //
-
-  if ([savePanel runModal] == NSModalResponseOK)
-  {
-    NSURL *documentURL = [savePanel URL];
-    auto fsp = fs::path{[[documentURL path] UTF8String]};
-    auto fn = fsp.replace_extension(".cwstream");
-
-    auto standaloneHost = freeaudio::clap_wrapper::standalone::getStandaloneHost();
-
-    try
-    {
-      standaloneHost->saveStandaloneAndPluginSettings(fn.parent_path(), fn.filename());
-    }
-    catch (const fs::filesystem_error &e)
-    {
-      NSAlert *alert = [[NSAlert alloc] init];
-      [alert setMessageText:@"Unable to save file"];
-      [alert setInformativeText:[[NSString alloc] initWithUTF8String:e.what()]];
-      [alert addButtonWithTitle:@"OK"];
-      [alert runModal];
-    }
-  }
-}
-
-- (IBAction)openWrapperFile:(id)sender
-{
-  NSOpenPanel *openPanel = [NSOpenPanel openPanel];
-  [openPanel setCanChooseFiles:YES];
-  [openPanel setCanChooseDirectories:NO];
-  [openPanel setAllowedFileTypes:[NSArray arrayWithObject:@"cwstream"]];
-  [openPanel setAllowsMultipleSelection:NO];
-
-  if ([openPanel runModal] == NSModalResponseOK)
-  {
-    NSURL *selectedUrl = [[openPanel URLs] objectAtIndex:0];
-
-    auto fn = fs::path{[[selectedUrl path] UTF8String]};
-
-    auto standaloneHost = freeaudio::clap_wrapper::standalone::getStandaloneHost();
-
-    try
-    {
-      standaloneHost->tryLoadStandaloneAndPluginSettings(fn.parent_path(), fn.filename());
-    }
-    catch (const fs::filesystem_error &e)
-    {
-      NSAlert *alert = [[NSAlert alloc] init];
-      [alert setMessageText:@"Unable to open file"];
-      [alert setInformativeText:[[NSString alloc] initWithUTF8String:e.what()]];
-      [alert addButtonWithTitle:@"OK"];
-      [alert runModal];
-    }
-  }
-}
-
 @end
 
 @implementation AudioSettingsWindow
@@ -436,16 +451,19 @@
     };
     [self setTitle:@"Audio/MIDI Settings"];
 
-    NSButton *okButton = [[NSButton alloc] initWithFrame:NSMakeRect(340, 16, 80, 30)];
-    [okButton setTitle:@"Apply"];
-    [okButton setTarget:self];
-    [okButton setAction:@selector(okButtonPressed:)];
-    [[self contentView] addSubview:okButton];
-
     NSButton *cancelButton = [[NSButton alloc] initWithFrame:NSMakeRect(428, 16, 80, 30)];
-    [cancelButton setTitle:@"Cancel"];
+    [cancelButton setTitle:@"Close"];
     [cancelButton setTarget:self];
     [cancelButton setAction:@selector(cancelButtonPressed:)];
+
+    statusLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(16, 20, 404, 24)];
+    [statusLabel setEditable:NO];
+    [statusLabel setSelectable:NO];
+    [statusLabel setBezeled:NO];
+    [statusLabel setDrawsBackground:NO];
+    [statusLabel setTextColor:[NSColor secondaryLabelColor]];
+    [statusLabel setStringValue:@"Changes apply automatically"];
+    [[self contentView] addSubview:statusLabel];
 
     [[self contentView] addSubview:addLabel(@"Output", 16, 540)];
     outputSelection = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(150, 536, 354, 28)];
@@ -479,13 +497,17 @@
     }
 
     [outputSelection addItemWithTitle:@"No Output"];
+    [outputSelection addItemWithTitle:@"System Default Output"];
     for (const auto &device : outputDevices)
       [outputSelection addItemWithTitle:[[NSString alloc] initWithUTF8String:device.name]];
     if ((selectedAudio.flags & CLAP_WRAPPER_STANDALONE_AUDIO_OUTPUT_ENABLED) != 0)
     {
-      for (auto index = 0u; index < outputDevices.size(); ++index)
-        if (outputDevices[index].id == selectedAudio.output_device_id)
-          [outputSelection selectItemAtIndex:index + 1];
+      if ((selectedAudio.flags & CLAP_WRAPPER_STANDALONE_AUDIO_FOLLOW_DEFAULT_OUTPUT) != 0)
+        [outputSelection selectItemAtIndex:1];
+      else
+        for (auto index = 0u; index < outputDevices.size(); ++index)
+          if (outputDevices[index].id == selectedAudio.output_device_id)
+            [outputSelection selectItemAtIndex:index + 2];
     }
     [outputSelection setAction:@selector(onAudioMenuChanged:)];
     [outputSelection setTarget:self];
@@ -511,6 +533,12 @@
     [[self contentView] addSubview:inputChannelSelection];
     [[self contentView] addSubview:sampleRateSelection];
     [[self contentView] addSubview:bufferSizeSelection];
+    for (NSPopUpButton *selection in
+         @[ outputChannelSelection, inputChannelSelection, sampleRateSelection, bufferSizeSelection ])
+    {
+      [selection setTarget:self];
+      [selection setAction:@selector(onSelectionChanged:)];
+    }
 
     for (const auto bufferSize :
          {16, 32, 48, 64, 96, 128, 144, 160, 192, 224, 256, 480, 512, 1024, 2048, 4096})
@@ -540,6 +568,8 @@
       [button setButtonType:NSButtonTypeSwitch];
       [button setTitle:[[NSString alloc] initWithUTF8String:midiPorts[index].name]];
       [button setState:isSelected(midiPorts[index].id) ? NSControlStateValueOn : NSControlStateValueOff];
+      [button setTarget:self];
+      [button setAction:@selector(onSelectionChanged:)];
       [midiView addSubview:button];
       midiPortButtons.push_back(button);
     }
@@ -550,7 +580,7 @@
   }
 }
 
-- (void)okButtonPressed:(id)sender
+- (void)applySelections
 {
   @autoreleasepool
   {
@@ -570,11 +600,19 @@
                               restored:YES];
         return;
       }
-      const auto &device = outputDevices[outputIndex - 1];
+      const auto deviceIndex = [self selectedOutputDeviceIndex];
+      if (deviceIndex < 0)
+      {
+        [self showConfigurationFailure:@"The system default output is unavailable." restored:YES];
+        return;
+      }
+      const auto &device = outputDevices[static_cast<std::size_t>(deviceIndex)];
       settings.output_device_id = device.id;
       settings.output_channels =
           static_cast<uint32_t>([[[outputChannelSelection selectedItem] title] integerValue]);
       settings.flags |= CLAP_WRAPPER_STANDALONE_AUDIO_OUTPUT_ENABLED;
+      if (outputIndex == 1)
+        settings.flags |= CLAP_WRAPPER_STANDALONE_AUDIO_FOLLOW_DEFAULT_OUTPUT;
     }
 
     const auto inputIndex = [inputSelection indexOfSelectedItem];
@@ -633,7 +671,8 @@
         static_cast<unsigned int>(settings.output_device_id), settings.output_channels,
         static_cast<int>(settings.sample_rate),
         (settings.flags & CLAP_WRAPPER_STANDALONE_AUDIO_INPUT_ENABLED) != 0,
-        (settings.flags & CLAP_WRAPPER_STANDALONE_AUDIO_OUTPUT_ENABLED) != 0);
+        (settings.flags & CLAP_WRAPPER_STANDALONE_AUDIO_OUTPUT_ENABLED) != 0,
+        (settings.flags & CLAP_WRAPPER_STANDALONE_AUDIO_FOLLOW_DEFAULT_OUTPUT) != 0);
     standaloneHost->currentBufferSize = settings.buffer_size;
 
     bool midiApplied = true;
@@ -649,14 +688,24 @@
       return;
     }
 
-    [self close];
+    selectedAudio = standaloneHost->services.selectedAudioSettings();
+    const auto actualBufferSize = selectedAudio.buffer_size;
+    const auto actualBufferSizeTitle = [NSString stringWithFormat:@"%u", actualBufferSize];
+    if ([bufferSizeSelection indexOfItemWithTitle:actualBufferSizeTitle] == -1)
+      [bufferSizeSelection addItemWithTitle:actualBufferSizeTitle];
+    [bufferSizeSelection selectItemWithTitle:actualBufferSizeTitle];
+    [statusLabel setTextColor:[NSColor systemGreenColor]];
+    [statusLabel setStringValue:[NSString
+        stringWithFormat:@"Applied — %u Hz, %u samples", selectedAudio.sample_rate,
+                         actualBufferSize]];
   }
 }
 
 - (void)defaultButtonPressed:(id)sender
 {
   auto standaloneHost = freeaudio::clap_wrapper::standalone::getStandaloneHost();
-  auto [in, out, sr] = standaloneHost->getDefaultAudioInOutSampleRate();
+  auto [in, ignoredOutput, sr] = standaloneHost->getDefaultAudioInOutSampleRate();
+  (void)ignoredOutput;
   int idx = 1;
   for (const auto &device : inputDevices)
   {
@@ -667,15 +716,7 @@
     idx++;
   }
 
-  idx = 0;
-  for (const auto &device : outputDevices)
-  {
-    if (device.id == out)
-    {
-      [outputSelection selectItemAtIndex:idx + 1];
-    }
-    idx++;
-  }
+  [outputSelection selectItemAtIndex:1];
 
   [self resetChannelSelections];
   [self resetSampleRateSelection];
@@ -688,6 +729,7 @@
       [sampleRateSelection selectItem:item];
     }
   }
+  [self applySelections];
 }
 
 - (void)cancelButtonPressed:(id)sender
@@ -702,6 +744,28 @@
 {
   [self resetChannelSelections];
   [self resetSampleRateSelection];
+  [self applySelections];
+}
+
+- (void)onSelectionChanged:(id)sender
+{
+  [self applySelections];
+}
+
+- (NSInteger)selectedOutputDeviceIndex
+{
+  const auto selection = [outputSelection indexOfSelectedItem];
+  if (selection <= 0) return -1;
+  if (selection >= 2) return selection - 2;
+
+  auto *standaloneHost = freeaudio::clap_wrapper::standalone::getStandaloneHost();
+  auto [ignoredInput, output, ignoredSampleRate] =
+      standaloneHost->getDefaultAudioInOutSampleRate();
+  (void)ignoredInput;
+  (void)ignoredSampleRate;
+  for (auto index = 0u; index < outputDevices.size(); ++index)
+    if (outputDevices[index].id == output) return static_cast<NSInteger>(index);
+  return -1;
 }
 
 - (void)resetChannelSelections
@@ -713,7 +777,8 @@
     [outputChannelSelection addItemWithTitle:@"Disabled"];
     [outputChannelSelection setEnabled:NO];
   }
-  else if (outputDevices[outputIndex - 1].output_channels < 2)
+  else if ([self selectedOutputDeviceIndex] < 0 ||
+           outputDevices[static_cast<std::size_t>([self selectedOutputDeviceIndex])].output_channels < 2)
   {
     [outputChannelSelection addItemWithTitle:@"Unavailable (stereo required)"];
     [outputChannelSelection setEnabled:NO];
@@ -756,35 +821,11 @@
 - (void)resetSampleRateSelection
 {
   [sampleRateSelection removeAllItems];
-  std::map<uint32_t, uint32_t> srAvail;
-  const auto outputIndex = [outputSelection indexOfSelectedItem];
-  const auto inputIndex = [inputSelection indexOfSelectedItem];
   auto *standaloneHost = freeaudio::clap_wrapper::standalone::getStandaloneHost();
-  uint32_t preferredSampleRate{};
-  const auto addDeviceRates = [&srAvail, &preferredSampleRate, standaloneHost](uint64_t deviceId,
-                                                                                 bool firstDevice) {
-    const auto info = standaloneHost->rtaDac->getDeviceInfo(static_cast<unsigned int>(deviceId));
-    if (firstDevice)
-      preferredSampleRate = static_cast<uint32_t>(info.currentSampleRate > 0
-                                                      ? info.currentSampleRate
-                                                      : info.preferredSampleRate);
-    for (const auto sampleRate : info.sampleRates)
-    {
-      if (firstDevice)
-        srAvail[static_cast<uint32_t>(sampleRate)] = 1;
-      else if (auto found = srAvail.find(static_cast<uint32_t>(sampleRate)); found != srAvail.end())
-        ++found->second;
-    }
-  };
-  if (outputIndex > 0) addDeviceRates(outputDevices[outputIndex - 1].id, true);
-  if (inputIndex > 0) addDeviceRates(inputDevices[inputIndex - 1].id, outputIndex <= 0);
-
-  const auto requiredCount = outputIndex > 0 && inputIndex > 0 ? 2u : 1u;
-  for (const auto &[sampleRate, count] : srAvail)
-  {
-    if (count == requiredCount)
+  const auto preferredSampleRate = selectedAudio.sample_rate;
+  for (const auto sampleRate : standaloneHost->getSampleRates())
+    if (sampleRate >= minimumSampleRate && sampleRate <= maximumSampleRate)
       [sampleRateSelection addItemWithTitle:[NSString stringWithFormat:@"%u", sampleRate]];
-  }
 
   if ([sampleRateSelection numberOfItems] == 0)
   {

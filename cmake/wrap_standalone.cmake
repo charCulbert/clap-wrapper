@@ -56,8 +56,12 @@ function(target_add_standalone_wrapper)
         set(SA_BUNDLE_VERSION "${PROJECT_VERSION}")
     endif()
 
-    guarantee_rtaudio()
-    guarantee_rtmidi()
+    if (NOT DEFINED CLAP_WRAPPER_CHOC_ROOT
+        OR NOT EXISTS
+            "${CLAP_WRAPPER_CHOC_ROOT}/choc/audio/io/choc_RtAudioPlayer.h")
+        message(FATAL_ERROR
+            "clap-wrapper standalone requires CLAP_WRAPPER_CHOC_ROOT")
+    endif()
     find_package(Threads REQUIRED)
 
     set(salib ${SA_TARGET}-clap-wrapper-standalone-lib)
@@ -67,11 +71,17 @@ function(target_add_standalone_wrapper)
             ${CLAP_WRAPPER_CMAKE_CURRENT_SOURCE_DIR}/src/detail/standalone/standalone_host_audio.cpp
             ${CLAP_WRAPPER_CMAKE_CURRENT_SOURCE_DIR}/src/detail/standalone/standalone_host_midi.cpp
             )
+    set_target_properties(${salib} PROPERTIES
+            CXX_STANDARD ${CLAP_WRAPPER_CXX_STANDARD}
+            CXX_STANDARD_REQUIRED TRUE
+            CXX_EXTENSIONS FALSE)
+    target_compile_features(${salib} PUBLIC
+            cxx_std_${CLAP_WRAPPER_CXX_STANDARD})
+    target_include_directories(${salib} PUBLIC
+            "${CLAP_WRAPPER_CHOC_ROOT}")
     target_link_libraries(${salib}
             PUBLIC
             clap-wrapper-shared-detail
-            base-sdk-rtmidi
-            base-sdk-rtaudio
             Threads::Threads
             )
     target_link_libraries(${salib} PRIVATE clap-wrapper-compile-options)
@@ -79,7 +89,14 @@ function(target_add_standalone_wrapper)
     if (APPLE)
         target_sources(${salib} PRIVATE)
         target_link_libraries(${salib}
-                PUBLIC "-framework AVFoundation" "-framework Foundation" "-framework CoreFoundation" "-framework AppKit")
+                PUBLIC
+                "-framework AppKit"
+                "-framework AudioToolbox"
+                "-framework AVFoundation"
+                "-framework CoreAudio"
+                "-framework CoreFoundation"
+                "-framework CoreMIDI"
+                "-framework Foundation")
 
     endif()
 
@@ -101,6 +118,7 @@ function(target_add_standalone_wrapper)
                 BUNDLE_NAME ${SA_OUTPUT_NAME}
                 BUNDLE_EXTENSION app
                 OUTPUT_NAME ${SA_OUTPUT_NAME}
+                XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER ${SA_BUNDLE_IDENTIFIER}
                 MACOSX_BUNDLE_BUNDLE_NAME ${SA_OUTPUT_NAME}
                 MACOSX_BUNDLE_SHORT_VERSION_STRING ${SA_BUNDLE_VERSION}
                 MACOSX_BUNDLE_LONG_VERSION_STRING ${SA_BUNDLE_VERSION}

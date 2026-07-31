@@ -94,13 +94,25 @@ bool testAbiAndNegotiation()
   negotiated.input_device_capacity = 1;
   negotiated.output_devices = &output;
   negotiated.output_device_capacity = 1;
+  clap_wrapper_standalone_audio_settings_t followsDefault{};
+  followsDefault.struct_size = sizeof(followsDefault);
+  followsDefault.output_device_id = 20;
+  followsDefault.output_channels = 2;
+  followsDefault.flags = CLAP_WRAPPER_STANDALONE_AUDIO_OUTPUT_ENABLED |
+                         CLAP_WRAPPER_STANDALONE_AUDIO_FOLLOW_DEFAULT_OUTPUT;
+  const bool defaultModeAccepted = services.applyAudioSettings(followsDefault);
+  auto invalidDefaultMode = followsDefault;
+  invalidDefaultMode.flags = CLAP_WRAPPER_STANDALONE_AUDIO_FOLLOW_DEFAULT_OUTPUT;
+  const bool defaultModeRequiresOutput = !services.applyAudioSettings(invalidDefaultMode);
   return expect(legacyV1IsGuarded && appendedV1IsVisible,
                 "appended v1 service pointers are guarded by struct_size") &&
          expect(rejected, "truncated snapshot ABI is rejected") &&
          expect(settingsRejected, "truncated audio settings ABI is rejected") &&
          expect(needsStorage, "snapshot reports required storage without partial output") &&
          expect(services.getAudioSnapshot(negotiated) && input.id == 10 && output.id == 20,
-                "snapshot succeeds after size negotiation");
+                "snapshot succeeds after size negotiation") &&
+         expect(defaultModeAccepted && defaultModeRequiresOutput,
+                "system-default output mode requires a valid enabled output route");
 }
 
 bool testIngressOrderCapacityAndRamp()

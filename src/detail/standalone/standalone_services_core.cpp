@@ -39,7 +39,8 @@ bool StandaloneServicesCore::validateAudioSettings(
     const clap_wrapper_standalone_audio_settings_t &settings) const
 {
   constexpr auto validFlags = CLAP_WRAPPER_STANDALONE_AUDIO_INPUT_ENABLED |
-                              CLAP_WRAPPER_STANDALONE_AUDIO_OUTPUT_ENABLED;
+                              CLAP_WRAPPER_STANDALONE_AUDIO_OUTPUT_ENABLED |
+                              CLAP_WRAPPER_STANDALONE_AUDIO_FOLLOW_DEFAULT_OUTPUT;
   if ((settings.flags & ~validFlags) != 0) return false;
 
   const auto validateRoute = [](const auto &devices, uint64_t id, uint32_t channels, bool enabled,
@@ -53,6 +54,9 @@ bool StandaloneServicesCore::validateAudioSettings(
 
   const auto inputEnabled = (settings.flags & CLAP_WRAPPER_STANDALONE_AUDIO_INPUT_ENABLED) != 0;
   const auto outputEnabled = (settings.flags & CLAP_WRAPPER_STANDALONE_AUDIO_OUTPUT_ENABLED) != 0;
+  const auto followsDefaultOutput =
+      (settings.flags & CLAP_WRAPPER_STANDALONE_AUDIO_FOLLOW_DEFAULT_OUTPUT) != 0;
+  if (followsDefaultOutput && !outputEnabled) return false;
   if (!validateRoute(inputDevices, settings.input_device_id, settings.input_channels, inputEnabled,
                      [](const auto &device) { return device.input_channels; }) ||
       !validateRoute(outputDevices, settings.output_device_id, settings.output_channels, outputEnabled,
