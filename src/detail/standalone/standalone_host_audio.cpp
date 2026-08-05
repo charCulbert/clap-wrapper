@@ -86,14 +86,18 @@ StandaloneHost::getDefaultAudioInOutSampleRate()
 
 bool StandaloneHost::startAudioThread()
 {
-  const auto input = startupAudioSet ? startAudioIn : uint64_t{};
-  const auto output = startupAudioSet ? startAudioOut : uint64_t{};
-  const auto sampleRate = startupAudioSet ? startSampleRate : 48000;
+  // An all-zero saved route is the unconfigured default, not a usable RtAudio
+  // stream. Fall back to the plugin's normal audio route in that case.
+  const bool hasConfiguredAudio = startupAudioSet &&
+                                  (startAudioInputUsed || startAudioOutputUsed);
+  const auto input = hasConfiguredAudio ? startAudioIn : uint64_t{};
+  const auto output = hasConfiguredAudio ? startAudioOut : uint64_t{};
+  const auto sampleRate = hasConfiguredAudio ? startSampleRate : 48000;
   return startAudioThreadOn(
-      input, startupAudioSet ? startAudioInputChannels : 2,
-      (startupAudioSet ? startAudioInputUsed : true) && numAudioInputs > 0,
-      output, startupAudioSet ? startAudioOutputChannels : 2,
-      (startupAudioSet ? startAudioOutputUsed : true) && numAudioOutputs > 0,
+      input, hasConfiguredAudio ? startAudioInputChannels : 2,
+      (hasConfiguredAudio ? startAudioInputUsed : true) && numAudioInputs > 0,
+      output, hasConfiguredAudio ? startAudioOutputChannels : 2,
+      (hasConfiguredAudio ? startAudioOutputUsed : true) && numAudioOutputs > 0,
       sampleRate);
 }
 

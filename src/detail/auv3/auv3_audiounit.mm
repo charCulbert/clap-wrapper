@@ -149,6 +149,12 @@ class AUv3ImplDetail : public Clap::IHost, public Clap::IAutomation, public os::
   std::unique_ptr<Clap::AUv3::ProcessAdapter> _processAdapter;
   const clap_plugin_descriptor_t *_desc = nullptr;
 
+  // Whether the plugin currently has a GUI. The audio unit outlives any single
+  // view controller and may serve several, so GUI liveness must be tracked here
+  // rather than per-controller: calling gui methods without a live create() is
+  // host misbehaviour that strict plugins treat as fatal.
+  bool _pluginGuiCreated = false;
+
   // Render-block handshake. The render thread reaches the adapter ONLY
   // through _processAdapterLive; deallocateRenderResources unpublishes it
   // and then drains _renderInFlight before the adapter is freed, so a
@@ -968,7 +974,7 @@ class AUv3ImplDetail : public Clap::IHost, public Clap::IAutomation, public os::
 // Static CLAP library holder
 // -----------------------------------------------------------------------
 
-static Clap::Library _library;
+static Clap::Library _library{false};
 
 // -----------------------------------------------------------------------
 // ClapAUv3AudioUnit implementation
@@ -2033,7 +2039,7 @@ static Clap::Library _library;
   {
     _impl->_webviewHost = std::make_unique<freeaudio::clap_wrapper::WebViewHost>(
         _impl->_plugin->_plugin, _impl->_plugin->_ext._webview,
-        _impl->_plugin->_ext._webviewGui);
+        _impl->_plugin->_ext._webviewGui, _impl->_plugin.get(), true);
 
     if (_impl->_webviewHost->isOpen())
     {
@@ -2043,16 +2049,19 @@ static Clap::Library _library;
 
       auto *view = (__bridge CLAPWRAP_ViewClass *)_impl->_webviewHost->viewHandle();
       [view setFrame:[parentView bounds]];
+
 #if TARGET_OS_IPHONE
       [view setAutoresizingMask:UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight];
 #else
       [view setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
 #endif
       [parentView addSubview:view];
+      _impl->_webviewHost->navigate();
 
       if (outWidth) *outWidth = width;
       if (outHeight) *outHeight = height;
       _impl->_guiParentView = parentView;
+      _impl->_pluginGuiCreated = true;
       return YES;
     }
 
@@ -2128,6 +2137,7 @@ static Clap::Library _library;
 
   // Update the IHost gui_request_resize to notify the view controller
   _impl->_guiParentView = parentView;
+  _impl->_pluginGuiCreated = true;
 
   return YES;
 }
@@ -2141,6 +2151,7 @@ static Clap::Library _library;
   if (_impl->_webviewHost)
   {
     _impl->_webviewHost.reset();
+    _impl->_pluginGuiCreated = false;
     _impl->_guiParentView = nil;
     _impl->_viewController = nil;
     return;
@@ -2148,8 +2159,12 @@ static Clap::Library _library;
 #endif
 
   if (!_impl->_plugin->_ext._gui) return;
-  _impl->_plugin->_ext._gui->hide(_impl->_plugin->_plugin);
-  _impl->_plugin->_ext._gui->destroy(_impl->_plugin->_plugin);
+  if (_impl->_pluginGuiCreated)
+  {
+    _impl->_plugin->_ext._gui->hide(_impl->_plugin->_plugin);
+    _impl->_plugin->_ext._gui->destroy(_impl->_plugin->_plugin);
+    _impl->_pluginGuiCreated = false;
+  }
   _impl->_guiParentView = nil;
   _impl->_viewController = nil;
 }
@@ -2157,17 +2172,28 @@ static Clap::Library _library;
 - (BOOL)canResizeGUI
 {
   if (!_impl || !_impl->_plugin) return NO;
+  if (!_impl->_pluginGuiCreated) return NO;
+
+  // Out-of-process AUv3 captured _main_thread_id on the XPC worker thread, so
+  // the proxy does not recognise the real main thread. Every route out of this
+  // method reaches the plugin's gui extension, which checks the calling thread,
+  // so the override must cover the webview path too.
+  auto mainGuard = _impl->_plugin->AlwaysMainThread();
 #if defined(CLAP_WRAPPER_HAS_CHOC_WEBVIEW)
   if (_impl->_webviewHost) return _impl->_webviewHost->canResize() ? YES : NO;
 #endif
   if (!_impl->_plugin->_ext._gui) return NO;
-  auto mainGuard = _impl->_plugin->AlwaysMainThread();
   return _impl->_plugin->_ext._gui->can_resize(_impl->_plugin->_plugin) ? YES : NO;
 }
 
 - (BOOL)setGUISize:(uint32_t)width height:(uint32_t)height
 {
   if (!_impl || !_impl->_plugin) return NO;
+  if (!_impl->_pluginGuiCreated) return NO;
+
+  // See canResizeGUI: the thread-identity override must cover the webview path,
+  // which also calls into the plugin's gui extension.
+  auto mainGuard = _impl->_plugin->AlwaysMainThread();
 #if defined(CLAP_WRAPPER_HAS_CHOC_WEBVIEW)
   if (_impl->_webviewHost)
   {
@@ -2178,7 +2204,6 @@ static Clap::Library _library;
   }
 #endif
   if (!_impl->_plugin->_ext._gui) return NO;
-  auto mainGuard = _impl->_plugin->AlwaysMainThread();
   return _impl->_plugin->_ext._gui->set_size(_impl->_plugin->_plugin, width, height) ? YES : NO;
 }
 
@@ -2291,6 +2316,7 @@ static Clap::Library _library;
 // Forward-declare private method used by ClapAUv3ContainerView
 @interface ClapAUv3ViewController ()
 - (void)_viewDidMoveToWindow;
+- (void)_tryCreateGUI;
 @end
 
 // -----------------------------------------------------------------------
@@ -2362,6 +2388,7 @@ static Clap::Library _library;
 @implementation ClapAUv3ViewController
 {
   BOOL _guiCreated;
+  BOOL _guiCreating;
 }
 
 - (CGSize)initialViewSize
@@ -2402,14 +2429,18 @@ static Clap::Library _library;
   if (audioUnit)
   {
     dispatch_async(dispatch_get_main_queue(), ^{
-      if (self.isViewLoaded && !self->_guiCreated) [self _applyInitialViewConfiguration];
+      if (self.isViewLoaded && !self->_guiCreated)
+      {
+        [self _applyInitialViewConfiguration];
+        [self _tryCreateGUI];
+      }
     });
   }
 }
 
-- (void)_createPluginGUI
+- (BOOL)_createPluginGUI
 {
-  if (!self.audioUnit) return;
+  if (!self.audioUnit) return NO;
 
   // Establish the back-reference so gui_request_resize can reach this VC
   [self.audioUnit setViewController:self];
@@ -2428,20 +2459,28 @@ static Clap::Library _library;
       self.preferredContentSize = CGSizeMake(w, h);
       [self didChangeValueForKey:@"preferredContentSize"];
     }
+    return YES;
   }
+
+  AUV3ERR("_createPluginGUI: createGUIInView failed; no plugin GUI was created");
+  return NO;
 }
 
-// Convergence point for GUI creation. Create as soon as the view is loaded so
-// preferredContentSize contains the CLAP GUI size before the host chooses its
-// editor window size. Some hosts ignore later preferred-size changes.
+// Convergence point for GUI creation. Create after the host attaches the AU
+// view to a window so WebKit can start its first navigation reliably.
 - (void)_tryCreateGUI
 {
-  if (_guiCreated) return;
+  if (_guiCreated || _guiCreating) return;
   if (!self.audioUnit) return;
-  if (!self.isViewLoaded) return;
+  if (!self.isViewLoaded || !self.view.window) return;
 
-  _guiCreated = YES;
-  [self _createPluginGUI];
+  // Only claim the GUI exists if it was actually created. Layout callbacks
+  // query the plugin's gui extension, and calling can_resize()/set_size()
+  // without a successful create() is host misbehaviour that strict plugins
+  // treat as fatal.
+  _guiCreating = YES;
+  _guiCreated = [self _createPluginGUI];
+  _guiCreating = NO;
 }
 
 // Called by ClapAUv3ContainerView when the view enters or leaves a window.

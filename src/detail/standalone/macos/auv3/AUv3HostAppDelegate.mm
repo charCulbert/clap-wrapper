@@ -243,6 +243,7 @@ static MIDIPortRef sMIDIInputPort = 0;
   switch ([AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio])
   {
     case AVAuthorizationStatusNotDetermined:
+    {
       [AVCaptureDevice requestAccessForMediaType:AVMediaTypeAudio
                                completionHandler:^(BOOL granted) {
                                  if (!granted) return;
@@ -258,6 +259,7 @@ static MIDIPortRef sMIDIInputPort = 0;
                                  });
                                }];
       break;
+    }
     default:
       break;
   }
@@ -284,14 +286,15 @@ static MIDIPortRef sMIDIInputPort = 0;
               << (compName ? [(__bridge NSString *)compName UTF8String] : "?") << std::endl;
     if (compName) CFRelease(compName);
 
-    __weak typeof(self) weakSelf = self;
+    __weak AUv3HostAppDelegate *weakSelf = self;
     [AVAudioUnit instantiateWithComponentDescription:desc
                                              options:kAudioComponentInstantiation_LoadInProcess
                                    completionHandler:^(AVAudioUnit *_Nullable audioUnit,
                                                        NSError *_Nullable error) {
                                      dispatch_async(dispatch_get_main_queue(), ^{
-                                       __strong typeof(weakSelf) self = weakSelf;
-                                       if (self) [self finishSetupWithAudioUnit:audioUnit error:error];
+                                       AUv3HostAppDelegate *strongSelf = weakSelf;
+                                       if (strongSelf)
+                                         [strongSelf finishSetupWithAudioUnit:audioUnit error:error];
                                      });
                                    }];
     return;
@@ -462,7 +465,23 @@ static MIDIPortRef sMIDIInputPort = 0;
       // Effect: input -> AU -> output
       AVAudioNode *input = _engine.inputNode;
       AVAudioFormat *inputFormat = [input outputFormatForBus:0];
-      [_engine connect:input to:_avAudioUnit format:inputFormat];
+      AVAudioFormat *pluginFormat = [_avAudioUnit inputFormatForBus:0];
+
+      if (pluginFormat.channelCount != 0 &&
+          pluginFormat.channelCount != inputFormat.channelCount)
+      {
+        // Hardware input is frequently mono while the plugin declares stereo.
+        // A mixer adapts the channel count; a direct connection would simply
+        // be refused by the audio unit.
+        AVAudioMixerNode *adapter = [[AVAudioMixerNode alloc] init];
+        [_engine attachNode:adapter];
+        [_engine connect:input to:adapter format:inputFormat];
+        [_engine connect:adapter to:_avAudioUnit format:pluginFormat];
+      }
+      else
+      {
+        [_engine connect:input to:_avAudioUnit format:inputFormat];
+      }
     }
     [_engine connect:_avAudioUnit to:output format:outputFormat];
   }

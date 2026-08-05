@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstring>
+#include <functional>
 #include <unordered_map>
 #include <unordered_set>
 #include <thread>
@@ -119,8 +120,12 @@ struct StandaloneHost : Clap::IHost, private choc::audio::io::AudioMIDICallback
 
   void mark_dirty() override
   {
-    TRACE;
+    dirtyStateGeneration.fetch_add(1, std::memory_order_release);
   }
+  std::atomic<uint64_t> dirtyStateGeneration{0};
+  uint64_t observedDirtyStateGeneration{0};
+  uint32_t dirtyStateSettlingTicks{0};
+  std::function<void()> saveDirtyState;
   std::atomic<bool> restartRequested{false};
   void restartPlugin() override
   {

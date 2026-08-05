@@ -145,7 +145,7 @@ std::unique_ptr<freeaudio::clap_wrapper::WebViewHost> webviewHost;
   if (plugin->_ext._webview)
   {
     webviewHost = std::make_unique<freeaudio::clap_wrapper::WebViewHost>(
-        plugin->_plugin, plugin->_ext._webview, plugin->_ext._webviewGui);
+        plugin->_plugin, plugin->_ext._webview, plugin->_ext._webviewGui, plugin.get(), true);
 
     if (webviewHost->isOpen())
     {
@@ -154,6 +154,7 @@ std::unique_ptr<freeaudio::clap_wrapper::WebViewHost> webviewHost;
       [view setFrame:[content bounds]];
       [view setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
       [content addSubview:view];
+      webviewHost->navigate();
       [[self window] setContentSize:NSMakeSize(webviewHost->width(), webviewHost->height())];
 
       freeaudio::clap_wrapper::standalone::getStandaloneHost()->sendWebviewMessage =

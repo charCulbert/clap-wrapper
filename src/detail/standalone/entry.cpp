@@ -59,6 +59,11 @@ std::shared_ptr<Clap::Plugin> mainCreatePlugin(const clap_plugin_entry *ee, cons
   if (pt.has_value())
   {
     auto loadPath = *pt / plugin->_plugin->desc->id;
+    standaloneHost->saveDirtyState = [loadPath]
+    {
+      if (standaloneHost)
+        standaloneHost->saveStandaloneAndPluginSettings(loadPath, "settings.clapwrapper");
+    };
 
     try
     {
@@ -155,6 +160,7 @@ int mainFinish()
     }
 
     standaloneHost->deactivatePlugin();
+    standaloneHost->saveDirtyState = {};
   }
   plugin.reset();
   standaloneHost.reset();

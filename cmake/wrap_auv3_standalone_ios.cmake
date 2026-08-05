@@ -13,6 +13,7 @@ function(target_add_auv3_standalone_ios_wrapper)
             OUTPUT_NAME
             BUNDLE_IDENTIFIER
             BUNDLE_VERSION
+            RESOURCE_DIRECTORY
 
             AUV3_TARGET
 
@@ -238,6 +239,14 @@ function(target_add_auv3_standalone_ios_wrapper)
             "-framework CoreMIDI"
             )
 
+    if (DEFINED CLAP_WRAPPER_CHOC_ROOT
+        AND EXISTS "${CLAP_WRAPPER_CHOC_ROOT}/choc/gui/choc_WebView.h")
+        target_include_directories(${AUSAIOS_TARGET} PRIVATE "${CLAP_WRAPPER_CHOC_ROOT}")
+        target_compile_definitions(${AUSAIOS_TARGET} PRIVATE CLAP_WRAPPER_HAS_CHOC_WEBVIEW=1)
+        target_compile_options(${AUSAIOS_TARGET} PRIVATE -Wno-cast-function-type-mismatch)
+        target_link_libraries(${AUSAIOS_TARGET} PRIVATE "-framework WebKit")
+    endif()
+
     # --- Bundle properties ---
     # TARGETED_DEVICE_FAMILY "1,2" = iPhone + iPad. Must match the embedded
     # appex's setting; if the host is iPhone-only, pluginkit won't register
@@ -294,6 +303,15 @@ function(target_add_auv3_standalone_ios_wrapper)
     # ID via PlistBuddy; we stopped doing that and instead require the
     # caller to choose `<host-id>.auv3` up front.
     add_dependencies(${AUSAIOS_TARGET} ${AUSAIOS_AUV3_TARGET})
+
+    if (DEFINED AUSAIOS_RESOURCE_DIRECTORY AND
+        NOT "${AUSAIOS_RESOURCE_DIRECTORY}" STREQUAL "")
+        add_custom_command(TARGET ${AUSAIOS_TARGET} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_directory
+                    "${AUSAIOS_RESOURCE_DIRECTORY}"
+                    "$<TARGET_BUNDLE_DIR:${AUSAIOS_TARGET}>"
+                COMMENT "Copying ${AUSAIOS_TARGET} resources")
+    endif()
 
     set(_appex_src "$<TARGET_BUNDLE_DIR:${AUSAIOS_AUV3_TARGET}>")
     set(_appex_dst "$<TARGET_BUNDLE_DIR:${AUSAIOS_TARGET}>/PlugIns/$<TARGET_PROPERTY:${AUSAIOS_AUV3_TARGET},OUTPUT_NAME>.appex")

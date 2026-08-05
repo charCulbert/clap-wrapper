@@ -4,6 +4,7 @@
 #include <clap/ext/draft/webview.h>
 
 #include <choc/gui/choc_WebView.h>
+#include "clap_proxy.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -18,33 +19,60 @@ namespace freeaudio::clap_wrapper
 
 class WebViewHost
 {
+  template <typename Function>
+  decltype(auto) withMainThread(Function &&function) const
+  {
+    if (threadCheckedPlugin != nullptr)
+    {
+      auto guard = threadCheckedPlugin->AlwaysMainThread();
+      return function();
+    }
+
+    return function();
+  }
+
 public:
   WebViewHost(const clap_plugin_t *plugin, const clap_plugin_webview_t *webview,
-              const clap_plugin_gui_t *sizingGui)
-      : plugin(plugin), webview(webview), sizingGui(sizingGui)
+              const clap_plugin_gui_t *sizingGui, Clap::Plugin *threadCheckedPlugin = nullptr,
+              bool deferInitialNavigation = false)
+      : plugin(plugin), webview(webview), sizingGui(sizingGui),
+        threadCheckedPlugin(threadCheckedPlugin)
   {
     if (!plugin || !webview || !webview->get_uri || !webview->get_resource || !webview->receive)
       return;
 
-    const auto uriSize = webview->get_uri(plugin, nullptr, 0);
+    const auto uriSize = withMainThread([&] { return webview->get_uri(plugin, nullptr, 0); });
     if (uriSize <= 1) return;
 
     std::string uri(static_cast<size_t>(uriSize), '\0');
-    if (webview->get_uri(plugin, uri.data(), static_cast<uint32_t>(uri.size())) != uriSize) return;
+    if (withMainThread([&] {
+          return webview->get_uri(plugin, uri.data(), static_cast<uint32_t>(uri.size()));
+        }) != uriSize)
+      return;
     uri.resize(static_cast<size_t>(uriSize - 1));
 
     startSizingGui();
 
     choc::ui::WebView::Options options;
+#if defined(CLAP_WRAPPER_HAS_CHOC_DEFERRED_NAVIGATION)
+    options.deferInitialNavigation = deferInitialNavigation;
+#else
+    (void) deferInitialNavigation;
+#endif
     auto navigationURI = uri;
+    auto navigateWhenReady = true;
     if (!isAbsoluteURI(uri))
     {
-      options.customSchemeURI = "clap-plugin://ui";
-      options.fetchResource = [this](const std::string &path) { return fetchResource(path); };
-      navigationURI = options.customSchemeURI + uri;
+      const auto slash = uri.find_last_of('/');
+      const auto directory = slash == std::string::npos ? std::string("/") : uri.substr(0, slash + 1);
+      options.customSchemeURI = "charclap://ui" + directory;
+      options.fetchResource = [this, directory, uri](const std::string &path) {
+        return fetchResource(isDirectoryRequest(path, directory) ? uri : path);
+      };
+      navigateWhenReady = false;
     }
 
-    options.webviewIsReady = [this, navigationURI](choc::ui::WebView &view) {
+    options.webviewIsReady = [this, navigationURI, navigateWhenReady](choc::ui::WebView &view) {
       view.bind("clapHostPostMessage", [this](const choc::value::ValueView &arguments) {
         if (!this->webview || !this->webview->receive || !arguments.isArray() ||
             arguments.size() != 1 ||
@@ -56,11 +84,14 @@ public:
         for (uint32_t i = 0; i < source.size(); ++i)
           bytes[i] = static_cast<uint8_t>(source[i].getWithDefault<int32_t>(0));
 
-        return choc::value::Value(this->webview->receive(
-            this->plugin, bytes.data(), static_cast<uint32_t>(bytes.size())));
+        const auto accepted = this->withMainThread([&] {
+          return this->webview->receive(this->plugin, bytes.data(),
+                                        static_cast<uint32_t>(bytes.size()));
+        });
+        return choc::value::Value(accepted);
       });
       view.addInitScript(messageBridgeScript);
-      view.navigate(navigationURI);
+      if (navigateWhenReady) view.navigate(navigationURI);
     };
 
     nativeView = std::make_unique<choc::ui::WebView>(options);
@@ -77,6 +108,12 @@ public:
   WebViewHost &operator=(const WebViewHost &) = delete;
 
   [[nodiscard]] bool isOpen() const noexcept { return nativeView != nullptr; }
+
+  bool navigate()
+  {
+    return nativeView && nativeView->navigate({});
+  }
+
   [[nodiscard]] void *viewHandle() const noexcept
   {
     return nativeView ? nativeView->getViewHandle() : nullptr;
@@ -84,11 +121,15 @@ public:
 
   [[nodiscard]] uint32_t width() const noexcept { return viewWidth; }
   [[nodiscard]] uint32_t height() const noexcept { return viewHeight; }
-  [[nodiscard]] bool canResize() const noexcept { return sizingGui && sizingGui->can_resize(plugin); }
+  [[nodiscard]] bool canResize() const noexcept
+  {
+    return sizingGui && withMainThread([&] { return sizingGui->can_resize(plugin); });
+  }
 
   bool setSize(uint32_t width, uint32_t height)
   {
-    if (sizingGui && !sizingGui->set_size(plugin, width, height)) return false;
+    if (sizingGui && !withMainThread([&] { return sizingGui->set_size(plugin, width, height); }))
+      return false;
     viewWidth = width;
     viewHeight = height;
     return true;
@@ -96,7 +137,8 @@ public:
 
   bool adjustSize(uint32_t &width, uint32_t &height) const
   {
-    return !sizingGui || !sizingGui->adjust_size || sizingGui->adjust_size(plugin, &width, &height);
+    return !sizingGui || !sizingGui->adjust_size ||
+           withMainThread([&] { return sizingGui->adjust_size(plugin, &width, &height); });
   }
 
   bool send(const void *buffer, uint32_t size)
@@ -150,6 +192,15 @@ private:
     }
   };
 
+  // WebKit hands the scheme handler the URL's normalised path, which drops the
+  // trailing slash: navigating to "charclap://ui/ui/" arrives here as "/ui".
+  // Treat both spellings as a request for the directory's index document.
+  static bool isDirectoryRequest(const std::string &path, const std::string &directory)
+  {
+    if (path == directory) return true;
+    return path.size() + 1 == directory.size() && directory.compare(0, path.size(), path) == 0;
+  }
+
   static bool isAbsoluteURI(const std::string &uri)
   {
     const auto colon = uri.find(':');
@@ -161,7 +212,9 @@ private:
   {
     char mime[256] {};
     ResourceStream stream;
-    if (!webview->get_resource(plugin, path.c_str(), mime, sizeof(mime), &stream.stream))
+    if (!withMainThread([&] {
+      return webview->get_resource(plugin, path.c_str(), mime, sizeof(mime), &stream.stream);
+    }))
       return std::nullopt;
 
     choc::ui::WebView::Options::Resource resource;
@@ -173,15 +226,17 @@ private:
   void startSizingGui()
   {
     if (!sizingGui || !sizingGui->is_api_supported ||
-        !sizingGui->is_api_supported(plugin, CLAP_WINDOW_API_WEBVIEW, false) ||
-        !sizingGui->create(plugin, CLAP_WINDOW_API_WEBVIEW, false))
+        !withMainThread([&] {
+          return sizingGui->is_api_supported(plugin, CLAP_WINDOW_API_WEBVIEW, false);
+        }) ||
+        !withMainThread([&] { return sizingGui->create(plugin, CLAP_WINDOW_API_WEBVIEW, false); }))
     {
       sizingGui = nullptr;
       return;
     }
 
     sizingGuiCreated = true;
-    sizingGui->get_size(plugin, &viewWidth, &viewHeight);
+    withMainThread([&] { sizingGui->get_size(plugin, &viewWidth, &viewHeight); });
     if (viewWidth == 0 || viewHeight == 0 || viewWidth > 16384 || viewHeight > 16384)
     {
       viewWidth = 800;
@@ -191,21 +246,22 @@ private:
     clap_window_t window {};
     window.api = CLAP_WINDOW_API_WEBVIEW;
     window.ptr = nullptr;
-    sizingGui->set_parent(plugin, &window);
-    sizingGui->show(plugin);
+    withMainThread([&] { sizingGui->set_parent(plugin, &window); });
+    withMainThread([&] { sizingGui->show(plugin); });
   }
 
   void stopSizingGui()
   {
     if (!sizingGuiCreated) return;
-    sizingGui->hide(plugin);
-    sizingGui->destroy(plugin);
+    withMainThread([&] { sizingGui->hide(plugin); });
+    withMainThread([&] { sizingGui->destroy(plugin); });
     sizingGuiCreated = false;
   }
 
   const clap_plugin_t *plugin = nullptr;
   const clap_plugin_webview_t *webview = nullptr;
   const clap_plugin_gui_t *sizingGui = nullptr;
+  Clap::Plugin *threadCheckedPlugin = nullptr;
   std::unique_ptr<choc::ui::WebView> nativeView;
   uint32_t viewWidth = 800;
   uint32_t viewHeight = 500;

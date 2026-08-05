@@ -37,7 +37,7 @@ class IHost;
 class Library
 {
  public:
-  Library();
+  explicit Library(bool discoverSelf = true);
   ~Library();
   bool load(const fs::path &);
 

@@ -550,6 +550,17 @@ void StandaloneHost::serviceMainThreadRequests()
     clapPlugin->_plugin->on_main_thread(clapPlugin->_plugin);
   }
 
+  const auto dirtyGeneration = dirtyStateGeneration.load(std::memory_order_acquire);
+  if (dirtyGeneration != observedDirtyStateGeneration)
+  {
+    observedDirtyStateGeneration = dirtyGeneration;
+    dirtyStateSettlingTicks = 4;
+  }
+  else if (dirtyStateSettlingTicks != 0 && --dirtyStateSettlingTicks == 0 && saveDirtyState)
+  {
+    saveDirtyState();
+  }
+
   if (!restartRequested.exchange(false)) return;
 
   const bool restartAudio = audioPlayer != nullptr && services.isAudioRunning();
@@ -709,25 +720,30 @@ bool StandaloneHost::tryLoadStandaloneAndPluginSettings(const fs::path &fromDir,
   VectorOutputStream priorPluginState;
   clap_ostream_t priorStream{&priorPluginState, VectorOutputStream::write};
   const auto havePriorPluginState = clapPlugin->save(&priorStream);
-  if (!restoreServiceSettings(envelope->audio, envelope->midiPortIds))
+
+  const auto restorePriorServices = [&]
   {
-    restart();
-    return false;
-  }
-  const auto loadedNewState = loadPluginState(clapPlugin, envelope->pluginState);
-  const auto restartedNewState = loadedNewState && restart();
-  if (restartedNewState) return true;
-  services.restoreSettings(priorAudio, priorMidi);
-  startupAudioSet = priorStartupSet;
-  startAudioIn = priorStartupIn;
-  startAudioOut = priorStartupOut;
-  startAudioInputChannels = priorStartupInputChannels;
-  startAudioOutputChannels = priorStartupOutputChannels;
-  startSampleRate = priorStartupRate;
-  startAudioInputUsed = priorStartupInputUsed;
-  startAudioOutputUsed = priorStartupOutputUsed;
-  followSystemDefaultOutput = priorFollowSystemDefaultOutput;
-  currentBufferSize = priorBufferSize;
+    services.restoreSettings(priorAudio, priorMidi);
+    startupAudioSet = priorStartupSet;
+    startAudioIn = priorStartupIn;
+    startAudioOut = priorStartupOut;
+    startAudioInputChannels = priorStartupInputChannels;
+    startAudioOutputChannels = priorStartupOutputChannels;
+    startSampleRate = priorStartupRate;
+    startAudioInputUsed = priorStartupInputUsed;
+    startAudioOutputUsed = priorStartupOutputUsed;
+    followSystemDefaultOutput = priorFollowSystemDefaultOutput;
+    currentBufferSize = priorBufferSize;
+  };
+
+  // Device restoration and plug-in state restoration are independent. A saved
+  // audio or MIDI device that is no longer available must not discard otherwise
+  // valid plug-in state, so keep the current devices and carry on.
+  if (!restoreServiceSettings(envelope->audio, envelope->midiPortIds)) restorePriorServices();
+
+  if (loadPluginState(clapPlugin, envelope->pluginState)) return restart();
+
+  restorePriorServices();
   if (havePriorPluginState) loadPluginState(clapPlugin, priorPluginState.bytes);
   const auto restartedPriorState = restart();
   if (!restartedPriorState)

@@ -385,7 +385,9 @@ function(target_add_auv3_wrapper)
     target_compile_options(${AUV3_TARGET} PRIVATE -fno-char8_t -fobjc-arc)
     if (_auv3_has_choc_webview)
         target_include_directories(${AUV3_TARGET} PRIVATE "${CLAP_WRAPPER_CHOC_ROOT}")
-        target_compile_definitions(${AUV3_TARGET} PRIVATE CLAP_WRAPPER_HAS_CHOC_WEBVIEW=1)
+        target_compile_definitions(${AUV3_TARGET} PRIVATE
+                CLAP_WRAPPER_HAS_CHOC_WEBVIEW=1
+                CLAP_WRAPPER_HAS_CHOC_DEFERRED_NAVIGATION=1)
         target_compile_options(${AUV3_TARGET} PRIVATE -Wno-cast-function-type-mismatch)
     endif()
 

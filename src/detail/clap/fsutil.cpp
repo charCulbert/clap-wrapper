@@ -280,11 +280,8 @@ void Library::useStaticEntry(const clap_plugin_entry_t *entry, const char *path)
 {
   if (!entry) return;
   // This is called against a process-wide Library on every plugin
-  // instantiation (and the constructor may already have wired the same
-  // entry under STATICALLY_LINKED_CLAP_ENTRY). clap_entry->init() must only
-  // run once per deinit and the descriptor list must not accumulate
-  // duplicates, so a repeated call with an already-initialized entry is a
-  // no-op. _pluginFactory is only set after a successful init.
+  // instantiation. A statically-linked AUv3 entry is wired after product
+  // globals are ready, so repeated calls can reuse the initialized factory.
   if (_pluginEntry == entry && _pluginFactory) return;
   _pluginEntry = entry;
   _selfcontained = true;
@@ -351,8 +348,10 @@ static void ffeomwe()
 }
 #endif
 
-Library::Library()
+Library::Library(bool discoverSelf)
 {
+  if (!discoverSelf) return;
+
 #if STATICALLY_LINKED_CLAP_ENTRY
   _pluginEntry = &clap_entry;
   _selfcontained = true;
