@@ -11,6 +11,7 @@
 #include "detail/standalone/entry.h"
 #include "detail/standalone/standalone_details.h"
 #include "detail/standalone/standalone_host.h"
+#include "detail/webview/webview_host.h"
 
 #include "detail/clap/fsutil.h"
 
@@ -18,6 +19,7 @@ namespace
 {
 constexpr uint32_t minimumSampleRate = 22050;
 constexpr uint32_t maximumSampleRate = 192000;
+std::unique_ptr<freeaudio::clap_wrapper::WebViewHost> webviewHost;
 }
 
 @interface ClapWrapperAppDelegate ()
@@ -140,7 +142,30 @@ constexpr uint32_t maximumSampleRate = 192000;
     return false;
   };
 
-  if (plugin->_ext._gui)
+  if (plugin->_ext._webview)
+  {
+    webviewHost = std::make_unique<freeaudio::clap_wrapper::WebViewHost>(
+        plugin->_plugin, plugin->_ext._webview, plugin->_ext._webviewGui);
+
+    if (webviewHost->isOpen())
+    {
+      auto *view = (__bridge NSView *)webviewHost->viewHandle();
+      auto *content = [[self window] contentView];
+      [view setFrame:[content bounds]];
+      [view setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+      [content addSubview:view];
+      [[self window] setContentSize:NSMakeSize(webviewHost->width(), webviewHost->height())];
+
+      freeaudio::clap_wrapper::standalone::getStandaloneHost()->sendWebviewMessage =
+          [](const void *buffer, uint32_t size) { return webviewHost->send(buffer, size); };
+    }
+    else
+    {
+      webviewHost.reset();
+    }
+  }
+
+  if (!webviewHost && plugin->_ext._gui)
   {
     auto ui = plugin->_ext._gui;
     auto p = plugin->_plugin;
@@ -264,7 +289,11 @@ constexpr uint32_t maximumSampleRate = 192000;
 
   auto plugin = freeaudio::clap_wrapper::standalone::getMainPlugin();
 
-  if (plugin && plugin->_ext._gui)
+  const auto usedWebview = webviewHost != nullptr;
+  freeaudio::clap_wrapper::standalone::getStandaloneHost()->sendWebviewMessage = nullptr;
+  webviewHost.reset();
+
+  if (!usedWebview && plugin && plugin->_ext._gui)
   {
     plugin->_ext._gui->hide(plugin->_plugin);
     plugin->_ext._gui->destroy(plugin->_plugin);
@@ -351,6 +380,14 @@ constexpr uint32_t maximumSampleRate = 192000;
 {
   auto plugin = freeaudio::clap_wrapper::standalone::getMainPlugin();
 
+  if (webviewHost)
+  {
+    auto *content = [[self window] contentView];
+    auto size = [content bounds].size;
+    webviewHost->setSize(static_cast<uint32_t>(size.width), static_cast<uint32_t>(size.height));
+    return;
+  }
+
   if (plugin && plugin->_ext._gui)
   {
     auto canRS = plugin->_ext._gui->can_resize(plugin->_plugin);
@@ -367,6 +404,27 @@ constexpr uint32_t maximumSampleRate = 192000;
 - (NSSize)windowWillResize:(NSWindow *)sender toSize:(NSSize)frameSize
 {
   auto plugin = freeaudio::clap_wrapper::standalone::getMainPlugin();
+
+  if (webviewHost)
+  {
+    if (!webviewHost->canResize())
+    {
+      auto *window = [self window];
+      auto content = [window contentRectForFrameRect:[window frame]];
+      content.size = NSMakeSize(webviewHost->width(), webviewHost->height());
+      return [window frameRectForContentRect:content].size;
+    }
+
+    auto *window = [self window];
+    auto frame = [window frame];
+    frame.size = frameSize;
+    auto content = [window contentRectForFrameRect:frame];
+    uint32_t width = static_cast<uint32_t>(content.size.width);
+    uint32_t height = static_cast<uint32_t>(content.size.height);
+    webviewHost->adjustSize(width, height);
+    content.size = NSMakeSize(width, height);
+    return [window frameRectForContentRect:content].size;
+  }
 
   if (plugin && plugin->_ext._gui)
   {

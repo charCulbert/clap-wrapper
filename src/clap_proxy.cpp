@@ -101,6 +101,10 @@ static void closed(const clap_host_t *host, bool was_destroyed)
 
 const clap_host_gui hostgui = {resize_hints_changed, request_resize, request_show, request_hide, closed};
 
+const clap_host_webview_t webview = {
+    [](const clap_host_t *host, const void *buffer, uint32_t size) -> bool
+    { return self(host)->hostImplementation()->webviewSend(buffer, size); }};
+
 const clap_host_timer_support hosttimer = {
     /* register_timer */ [](const clap_host_t *host, uint32_t period_ms, clap_id *timer_id) -> bool
     { return self(host)->register_timer(period_ms, timer_id); },
@@ -250,6 +254,9 @@ void Plugin::connectClap(const clap_plugin_t *clap)
   getExtension(_plugin, _ext._render, CLAP_EXT_RENDER);
   getExtension(_plugin, _ext._tail, CLAP_EXT_TAIL);
   getExtension(_plugin, _ext._gui, CLAP_EXT_GUI);
+  getExtension(_plugin, _ext._webview, CLAP_EXT_WEBVIEW);
+  if (_ext._gui && _ext._gui->is_api_supported(_plugin, CLAP_WINDOW_API_WEBVIEW, false))
+    _ext._webviewGui = _ext._gui;
   getExtension(_plugin, _ext._timer, CLAP_EXT_TIMER_SUPPORT);
   getExtension(_plugin, _ext._trackinfo, CLAP_EXT_TRACK_INFO);
   getExtension(_plugin, _ext._ara, CLAP_EXT_ARA_PLUGINEXTENSION);
@@ -571,6 +578,12 @@ const void *Plugin::clapExtension(const clap_host *host, const char *extension)
   if (!strcmp(extension, CLAP_EXT_STATE)) return &HostExt::state;
   if (!strcmp(extension, CLAP_EXT_CONTEXT_MENU)) return &HostExt::context_menu;
   if (!strcmp(extension, CLAP_EXT_EVENT_REGISTRY)) return &HostExt::eventregistry;
+
+  if (!strcmp(extension, CLAP_EXT_WEBVIEW))
+  {
+    auto *plugin = static_cast<Plugin *>(host->host_data);
+    return plugin->_parentHost->supportsWebview() ? &HostExt::webview : nullptr;
+  }
 
   if (auto *plugin = static_cast<Plugin *>(host->host_data))
   {

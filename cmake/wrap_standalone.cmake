@@ -98,6 +98,8 @@ function(target_add_standalone_wrapper)
                 "-framework CoreMIDI"
                 "-framework Foundation")
 
+        target_link_libraries(${salib} PUBLIC "-framework WebKit")
+
     endif()
 
     if (APPLE)
@@ -115,14 +117,14 @@ function(target_add_standalone_wrapper)
 
         set_target_properties(${SA_TARGET} PROPERTIES
                 BUNDLE TRUE
-                BUNDLE_NAME ${SA_OUTPUT_NAME}
+                BUNDLE_NAME "${SA_OUTPUT_NAME}"
                 BUNDLE_EXTENSION app
-                OUTPUT_NAME ${SA_OUTPUT_NAME}
-                XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER ${SA_BUNDLE_IDENTIFIER}
-                MACOSX_BUNDLE_BUNDLE_NAME ${SA_OUTPUT_NAME}
-                MACOSX_BUNDLE_SHORT_VERSION_STRING ${SA_BUNDLE_VERSION}
-                MACOSX_BUNDLE_LONG_VERSION_STRING ${SA_BUNDLE_VERSION}
-                MACOSX_BUNDLE_BUNDLE_VERSION ${SA_BUNDLE_VERSION}
+                OUTPUT_NAME "${SA_OUTPUT_NAME}"
+                XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "${SA_BUNDLE_IDENTIFIER}"
+                MACOSX_BUNDLE_BUNDLE_NAME "${SA_OUTPUT_NAME}"
+                MACOSX_BUNDLE_SHORT_VERSION_STRING "${SA_BUNDLE_VERSION}"
+                MACOSX_BUNDLE_LONG_VERSION_STRING "${SA_BUNDLE_VERSION}"
+                MACOSX_BUNDLE_BUNDLE_VERSION "${SA_BUNDLE_VERSION}"
                 MACOSX_BUNDLE TRUE
                 MACOSX_BUNDLE_INFO_PLIST ${CLAP_WRAPPER_CMAKE_CURRENT_SOURCE_DIR}/src/detail/standalone/macos/Info.plist.in
                 RESOURCE "${GEN_XIB}"
@@ -196,9 +198,20 @@ function(target_add_standalone_wrapper)
                 ${CLAP_WRAPPER_CMAKE_CURRENT_SOURCE_DIR}/src/wrapasstandalone.cpp)
     endif()
 
-    # Copy resource directory, if defined
     if(NOT SA_RESOURCE_DIRECTORY STREQUAL "")
-        message(WARNING "RESOURCE_DIRECTORY defined, but not (yet) supported for standalone")
+        if(APPLE)
+            add_custom_command(TARGET ${SA_TARGET} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_directory
+                    "${SA_RESOURCE_DIRECTORY}"
+                    "$<TARGET_BUNDLE_DIR:${SA_TARGET}>/Contents/Resources"
+                VERBATIM)
+        else()
+            add_custom_command(TARGET ${SA_TARGET} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_directory
+                    "${SA_RESOURCE_DIRECTORY}"
+                    "$<TARGET_FILE_DIR:${SA_TARGET}>/Resources"
+                VERBATIM)
+        endif()
     endif()
 
     if (DEFINED SA_HOSTED_CLAP_NAME)

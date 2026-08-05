@@ -366,10 +366,10 @@ function(make_clapfirst_plugins)
             # set the RUNTIME path because module.wasm are built as binaries (dynamic libraries for WASM aren't well-defined)
             if (NOT WIN32)
                 set_target_properties(${WCLAP_TARGET} PROPERTIES
-                        RUNTIME_OUTPUT_DIRECTORY ${C1ST_ASSET_OUTPUT_DIRECTORY}/${C1ST_OUTPUT_NAME}.wclap)
+                        RUNTIME_OUTPUT_DIRECTORY "${C1ST_ASSET_OUTPUT_DIRECTORY}")
             else ()
                 set_target_properties(${WCLAP_TARGET} PROPERTIES
-                        RUNTIME_OUTPUT_DIRECTORY "${C1ST_ASSET_OUTPUT_DIRECTORY}/WCLAP/${C1ST_OUTPUT_NAME}.wclap")
+                        RUNTIME_OUTPUT_DIRECTORY "${C1ST_ASSET_OUTPUT_DIRECTORY}/WCLAP")
             endif()
         endif()
 

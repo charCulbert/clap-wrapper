@@ -187,6 +187,22 @@ struct StandaloneHost : Clap::IHost, private choc::audio::io::AudioMIDICallback
     return false;
   }
 
+  bool supportsWebview() const override
+  {
+#if MAC
+    return true;
+#else
+    return false;
+#endif
+  }
+
+  bool webviewSend(const void *buffer, uint32_t size) override
+  {
+    return sendWebviewMessage && sendWebviewMessage(buffer, size);
+  }
+
+  std::function<bool(const void *, uint32_t)> sendWebviewMessage;
+
 #if LIN && CLAP_WRAPPER_STANDALONE_X11
   freeaudio::clap_wrapper::standalone::linux_standalone::X11Gui *x11Gui{nullptr};
 #endif

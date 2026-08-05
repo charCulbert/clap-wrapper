@@ -15,6 +15,7 @@
 
 #include <clap/clap.h>
 #include <clap/ext/event-registry.h>
+#include <clap/ext/draft/webview.h>
 #include <vector>
 #include <string>
 #include <memory>
@@ -70,6 +71,9 @@ class IHost
   virtual bool gui_request_show() = 0;
   virtual bool gui_request_hide() = 0;
 
+  virtual bool supportsWebview() const { return false; }
+  virtual bool webviewSend(const void *, uint32_t) { return false; }
+
   virtual bool register_timer(uint32_t period_ms, clap_id *timer_id) = 0;
   virtual bool unregister_timer(clap_id timer_id) = 0;
 
@@ -114,6 +118,8 @@ struct ClapPluginExtensions
   const clap_plugin_audio_ports_activation_t *_audio_ports_activation = nullptr;
   const clap_plugin_configurable_audio_ports_t *_configurable_audio_ports = nullptr;
   const clap_plugin_gui_t *_gui = nullptr;
+  const clap_plugin_gui_t *_webviewGui = nullptr;
+  const clap_plugin_webview_t *_webview = nullptr;
   const clap_plugin_note_ports_t *_noteports = nullptr;
   const clap_plugin_latency_t *_latency = nullptr;
   const clap_plugin_render_t *_render = nullptr;

@@ -365,6 +365,12 @@ function(target_add_auv3_wrapper)
 
     message(STATUS "clap-wrapper: Adding AUv3 Wrapper to target ${AUV3_TARGET} generating '${AUV3_OUTPUT_NAME}.appex'")
 
+    set(_auv3_has_choc_webview FALSE)
+    if (DEFINED CLAP_WRAPPER_CHOC_ROOT
+        AND EXISTS "${CLAP_WRAPPER_CHOC_ROOT}/choc/gui/choc_WebView.h")
+        set(_auv3_has_choc_webview TRUE)
+    endif()
+
     target_sources(${AUV3_TARGET} PRIVATE ${CLAP_WRAPPER_CMAKE_CURRENT_SOURCE_DIR}/src/detail/os/macos.mm)
 
     target_sources(${AUV3_TARGET} PRIVATE
@@ -377,6 +383,11 @@ function(target_add_auv3_wrapper)
         target_sources(${AUV3_TARGET} PRIVATE "${AUV3_FACTORY_SOURCE}")
     endif()
     target_compile_options(${AUV3_TARGET} PRIVATE -fno-char8_t -fobjc-arc)
+    if (_auv3_has_choc_webview)
+        target_include_directories(${AUV3_TARGET} PRIVATE "${CLAP_WRAPPER_CHOC_ROOT}")
+        target_compile_definitions(${AUV3_TARGET} PRIVATE CLAP_WRAPPER_HAS_CHOC_WEBVIEW=1)
+        target_compile_options(${AUV3_TARGET} PRIVATE -Wno-cast-function-type-mismatch)
+    endif()
 
     if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
         # On iOS the appex can't dlopen a .clap, so the hosted CLAP's
@@ -443,6 +454,10 @@ function(target_add_auv3_wrapper)
                 "-framework CoreMIDI")
     endif()
 
+    if (_auv3_has_choc_webview)
+        target_link_libraries(${AUV3_TARGET} PUBLIC "-framework WebKit")
+    endif()
+
     set_target_properties(${AUV3_TARGET} PROPERTIES
             MACOSX_BUNDLE True
             BUNDLE_EXTENSION appex
@@ -491,7 +506,19 @@ function(target_add_auv3_wrapper)
     endif()
 
     if(NOT AUV3_RESOURCE_DIRECTORY STREQUAL "")
-        message(WARNING "RESOURCE_DIRECTORY defined, but not (yet) supported for AUV3")
+        if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+            add_custom_command(TARGET ${AUV3_TARGET} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_directory
+                    "${AUV3_RESOURCE_DIRECTORY}"
+                    "$<TARGET_BUNDLE_DIR:${AUV3_TARGET}>"
+                VERBATIM)
+        else()
+            add_custom_command(TARGET ${AUV3_TARGET} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_directory
+                    "${AUV3_RESOURCE_DIRECTORY}"
+                    "$<TARGET_BUNDLE_DIR:${AUV3_TARGET}>/Contents/Resources"
+                VERBATIM)
+        endif()
     endif()
 
     if (CMAKE_SYSTEM_NAME STREQUAL "iOS")

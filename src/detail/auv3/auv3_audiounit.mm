@@ -11,6 +11,9 @@
 #include "detail/os/osutil.h"
 #include "detail/shared/fixedqueue.h"
 #include "detail/clap/automation.h"
+#if defined(CLAP_WRAPPER_HAS_CHOC_WEBVIEW)
+#include "detail/webview/webview_host.h"
+#endif
 
 #include <os/log.h>
 #include <unistd.h>
@@ -35,7 +38,6 @@ static os_log_t _auv3Log()
 #define AUV3LOG(...) os_log(_auv3Log(), __VA_ARGS__)
 #define AUV3ERR(...) os_log_error(_auv3Log(), __VA_ARGS__)
 
-#if !defined(CLAP_WRAPPER_HAS_CHARDIO_AUV3_METADATA)
 static bool auv3NotePortsSupportMPE(const clap_plugin_t *plugin)
 {
   if (!plugin || !plugin->get_extension) return false;
@@ -53,7 +55,6 @@ static bool auv3NotePortsSupportMPE(const clap_plugin_t *plugin)
   }
   return false;
 }
-#endif
 
 bool Clap::AUv3::inputNotePortsSupportMIDI2(const clap_plugin_t *plugin,
                                              const clap_plugin_note_ports_t *notePorts)
@@ -76,152 +77,6 @@ NSTimeInterval Clap::AUv3::tailTimeForSamples(uint32_t samples, double sampleRat
     return std::numeric_limits<NSTimeInterval>::infinity();
   return sampleRate > 0 ? static_cast<NSTimeInterval>(samples) / sampleRate : 0;
 }
-
-#if defined(CLAP_WRAPPER_HAS_CHARDIO_AUV3_METADATA)
-namespace
-{
-bool hasChardioMetadataField(uint32_t structSize, size_t fieldEnd)
-{
-  return structSize >= fieldEnd;
-}
-
-template <typename Type>
-constexpr size_t chardioFieldEnd(size_t offset)
-{
-  return offset + sizeof(Type);
-}
-}  // namespace
-
-namespace Clap::AUv3
-{
-ChardioRuntimeMetadata ChardioRuntimeMetadata::find(const clap_plugin_t *plugin)
-{
-  if (!plugin || !plugin->get_extension) return ChardioRuntimeMetadata(nullptr);
-
-  const auto *metadata = static_cast<const chardio_plugin_auv3_metadata_t *>(
-      plugin->get_extension(plugin, CHARDIO_PLUGIN_EXT_AUV3_METADATA));
-  if (!metadata ||
-      !hasChardioMetadataField(metadata->struct_size,
-                               chardioFieldEnd<uint32_t>(offsetof(chardio_plugin_auv3_metadata_t, version))) ||
-      metadata->version != CHARDIO_PLUGIN_AUV3_METADATA_VERSION)
-    return ChardioRuntimeMetadata(nullptr);
-
-  return ChardioRuntimeMetadata(metadata);
-}
-
-bool ChardioRuntimeMetadata::prepareForAUv3(const clap_plugin_t *plugin) const
-{
-  if (!_metadata ||
-      !hasChardioMetadataField(
-          _metadata->struct_size,
-          chardioFieldEnd<decltype(_metadata->prepare_for_auv3)>(
-              offsetof(chardio_plugin_auv3_metadata_t, prepare_for_auv3))) ||
-      !_metadata->prepare_for_auv3)
-    return true;
-
-  return _metadata->prepare_for_auv3(plugin);
-}
-
-std::vector<ChardioFactoryPreset> ChardioRuntimeMetadata::factoryPresets(
-    const clap_plugin_t *plugin) const
-{
-  std::vector<ChardioFactoryPreset> result;
-  if (!_metadata ||
-      !hasChardioMetadataField(
-          _metadata->struct_size,
-          chardioFieldEnd<decltype(_metadata->get_factory_preset_count)>(
-              offsetof(chardio_plugin_auv3_metadata_t, get_factory_preset_count))) ||
-      !hasChardioMetadataField(
-          _metadata->struct_size,
-          chardioFieldEnd<decltype(_metadata->get_factory_preset)>(
-              offsetof(chardio_plugin_auv3_metadata_t, get_factory_preset))) ||
-      !_metadata->get_factory_preset_count || !_metadata->get_factory_preset)
-    return result;
-
-  const auto count = _metadata->get_factory_preset_count(plugin);
-  result.reserve(count);
-  for (uint32_t index = 0; index < count; ++index)
-  {
-    chardio_auv3_factory_preset_t preset{};
-    preset.struct_size = sizeof(preset);
-    if (!_metadata->get_factory_preset(plugin, index, &preset, sizeof(preset)) ||
-        !hasChardioMetadataField(
-            preset.struct_size,
-            chardioFieldEnd<int32_t>(offsetof(chardio_auv3_factory_preset_t, number))) ||
-        !hasChardioMetadataField(
-            preset.struct_size,
-            chardioFieldEnd<const char *>(offsetof(chardio_auv3_factory_preset_t, name))) ||
-        !preset.name)
-      continue;
-
-    result.push_back({preset.number, preset.name});
-  }
-  return result;
-}
-
-bool ChardioRuntimeMetadata::loadFactoryPreset(const clap_plugin_t *plugin, int32_t number) const
-{
-  if (!_metadata ||
-      !hasChardioMetadataField(
-          _metadata->struct_size,
-          chardioFieldEnd<decltype(_metadata->load_factory_preset)>(
-              offsetof(chardio_plugin_auv3_metadata_t, load_factory_preset))) ||
-      !_metadata->load_factory_preset)
-    return false;
-
-  return _metadata->load_factory_preset(plugin, number);
-}
-
-bool ChardioRuntimeMetadata::getViewConfiguration(const clap_plugin_t *plugin,
-                                                   ChardioViewConfiguration &result) const
-{
-  if (!_metadata ||
-      !hasChardioMetadataField(
-          _metadata->struct_size,
-          chardioFieldEnd<decltype(_metadata->get_view_configuration)>(
-              offsetof(chardio_plugin_auv3_metadata_t, get_view_configuration))) ||
-      !_metadata->get_view_configuration)
-    return false;
-
-  chardio_auv3_view_configuration_t view{};
-  view.struct_size = sizeof(view);
-  if (!_metadata->get_view_configuration(plugin, &view, sizeof(view)) ||
-      !hasChardioMetadataField(
-          view.struct_size,
-          chardioFieldEnd<uint32_t>(offsetof(chardio_auv3_view_configuration_t, minimum_width))) ||
-      !hasChardioMetadataField(
-          view.struct_size,
-          chardioFieldEnd<uint32_t>(offsetof(chardio_auv3_view_configuration_t, minimum_height))) ||
-      !hasChardioMetadataField(
-          view.struct_size,
-          chardioFieldEnd<chardio_auv3_view_policy_t>(
-              offsetof(chardio_auv3_view_configuration_t, policy))) ||
-      (view.policy != CHARDIO_AUV3_VIEW_POLICY_HOST_DEFAULT &&
-       view.policy != CHARDIO_AUV3_VIEW_POLICY_FIXED &&
-       view.policy != CHARDIO_AUV3_VIEW_POLICY_RESIZABLE))
-    return false;
-
-  result = {view.minimum_width, view.minimum_height, view.policy};
-  return true;
-}
-
-bool ChardioRuntimeMetadata::supportsMPE(const clap_plugin_t *plugin) const
-{
-  chardio_auv3_mpe_policy_t policy = CHARDIO_AUV3_MPE_POLICY_FROM_NOTE_PORTS;
-  if (_metadata &&
-      hasChardioMetadataField(
-          _metadata->struct_size,
-          chardioFieldEnd<decltype(_metadata->get_mpe_policy)>(
-              offsetof(chardio_plugin_auv3_metadata_t, get_mpe_policy))) &&
-      _metadata->get_mpe_policy)
-  {
-    const auto explicitPolicy = _metadata->get_mpe_policy(plugin);
-    if (chardio_auv3_mpe_policy_is_valid(explicitPolicy)) policy = explicitPolicy;
-  }
-  return chardio_auv3_mpe_policy_supports_mpe(policy, plugin);
-}
-}  // namespace Clap::AUv3
-#endif
 
 // drainParameterQueue and the bypass setter reflect already-delivered values
 // into the AUParameter tree via setValue:originator:. The tree's
@@ -288,6 +143,9 @@ class AUv3ImplDetail : public Clap::IHost, public Clap::IAutomation, public os::
 
   // CLAP plugin state
   std::shared_ptr<Clap::Plugin> _plugin;
+#if defined(CLAP_WRAPPER_HAS_CHOC_WEBVIEW)
+  std::unique_ptr<freeaudio::clap_wrapper::WebViewHost> _webviewHost;
+#endif
   std::unique_ptr<Clap::AUv3::ProcessAdapter> _processAdapter;
   const clap_plugin_descriptor_t *_desc = nullptr;
 
@@ -314,13 +172,6 @@ class AUv3ImplDetail : public Clap::IHost, public Clap::IAutomation, public os::
   bool _supportsMIDI2 = false;
   bool _supportsMPE = false;
   std::vector<NSString *> _midiOutputNames;
-
-#if defined(CLAP_WRAPPER_HAS_CHARDIO_AUV3_METADATA)
-  Clap::AUv3::ChardioRuntimeMetadata _chardioRuntimeMetadata;
-  std::vector<Clap::AUv3::ChardioFactoryPreset> _factoryPresets;
-  Clap::AUv3::ChardioViewConfiguration _viewConfiguration;
-  bool _hasViewConfiguration = false;
-#endif
 
   // Parameters
   AUParameterTree *_parameterTree = nil;
@@ -407,6 +258,24 @@ class AUv3ImplDetail : public Clap::IHost, public Clap::IAutomation, public os::
     // the render thread — JUCE holds locks in on_main_thread() that
     // process() also needs, causing deadlock.
     _requestUICallback = true;
+  }
+
+  bool supportsWebview() const override
+  {
+#if defined(CLAP_WRAPPER_HAS_CHOC_WEBVIEW)
+    return true;
+#else
+    return false;
+#endif
+  }
+
+  bool webviewSend(const void *buffer, uint32_t size) override
+  {
+#if defined(CLAP_WRAPPER_HAS_CHOC_WEBVIEW)
+    return _webviewHost && _webviewHost->send(buffer, size);
+#else
+    return false;
+#endif
   }
 
   void startIdleTimer()
@@ -1264,28 +1133,7 @@ static Clap::Library _library;
     AUV3LOG("init: calling plugin->initialize()");
     _impl->_plugin->initialize();
 
-#if defined(CLAP_WRAPPER_HAS_CHARDIO_AUV3_METADATA)
-    {
-      auto mainGuard = _impl->_plugin->AlwaysMainThread();
-      _impl->_chardioRuntimeMetadata =
-          Clap::AUv3::ChardioRuntimeMetadata::find(_impl->_plugin->_plugin);
-      if (!_impl->_chardioRuntimeMetadata.prepareForAUv3(_impl->_plugin->_plugin))
-      {
-        if (outError)
-          *outError = [NSError
-              errorWithDomain:@"ClapAUv3"
-                         code:-5
-                     userInfo:@{NSLocalizedDescriptionKey : @"CLAP plugin rejected AUv3 preparation"}];
-        return nil;
-      }
-      _impl->_factoryPresets = _impl->_chardioRuntimeMetadata.factoryPresets(_impl->_plugin->_plugin);
-      _impl->_hasViewConfiguration = _impl->_chardioRuntimeMetadata.getViewConfiguration(
-          _impl->_plugin->_plugin, _impl->_viewConfiguration);
-      _impl->_supportsMPE = _impl->_chardioRuntimeMetadata.supportsMPE(_impl->_plugin->_plugin);
-    }
-#else
     _impl->_supportsMPE = auv3NotePortsSupportMPE(_impl->_plugin->_plugin);
-#endif
 
     // Cache the initial latency so the AUv3 host can read it from any thread.
     if (_impl->_plugin->_ext._latency)
@@ -1605,89 +1453,6 @@ static Clap::Library _library;
   return _impl && _impl->_supportsMPE ? YES : NO;
 }
 
-- (BOOL)getViewPolicy:(uint32_t *)outPolicy
-          minimumWidth:(uint32_t *)outMinimumWidth
-         minimumHeight:(uint32_t *)outMinimumHeight
-{
-#if defined(CLAP_WRAPPER_HAS_CHARDIO_AUV3_METADATA)
-  if (!_impl || !_impl->_hasViewConfiguration) return NO;
-  if (outPolicy) *outPolicy = _impl->_viewConfiguration.policy;
-  if (outMinimumWidth) *outMinimumWidth = _impl->_viewConfiguration.minimumWidth;
-  if (outMinimumHeight) *outMinimumHeight = _impl->_viewConfiguration.minimumHeight;
-  return YES;
-#else
-  return NO;
-#endif
-}
-
-- (NSIndexSet *)supportedViewConfigurations:
-    (NSArray<AUAudioUnitViewConfiguration *> *)availableViewConfigurations
-{
-  uint32_t policy = 0, minimumWidth = 0, minimumHeight = 0;
-  if (![self getViewPolicy:&policy minimumWidth:&minimumWidth minimumHeight:&minimumHeight])
-    return [super supportedViewConfigurations:availableViewConfigurations];
-
-#if defined(CLAP_WRAPPER_HAS_CHARDIO_AUV3_METADATA)
-  if (policy == CHARDIO_AUV3_VIEW_POLICY_HOST_DEFAULT)
-    return [super supportedViewConfigurations:availableViewConfigurations];
-
-  NSMutableIndexSet *result = [NSMutableIndexSet indexSet];
-  [availableViewConfigurations
-      enumerateObjectsUsingBlock:^(AUAudioUnitViewConfiguration *configuration, NSUInteger index,
-                                   BOOL *) {
-        const bool matches = policy == CHARDIO_AUV3_VIEW_POLICY_FIXED
-                                 ? configuration.width == minimumWidth &&
-                                       configuration.height == minimumHeight
-                                 : configuration.width >= minimumWidth &&
-                                       configuration.height >= minimumHeight;
-        if (matches) [result addIndex:index];
-      }];
-  return result;
-#else
-  return [super supportedViewConfigurations:availableViewConfigurations];
-#endif
-}
-
-- (void)selectViewConfiguration:(AUAudioUnitViewConfiguration *)viewConfiguration
-{
-  uint32_t policy = 0, minimumWidth = 0, minimumHeight = 0;
-  if (![self getViewPolicy:&policy minimumWidth:&minimumWidth minimumHeight:&minimumHeight])
-  {
-    [super selectViewConfiguration:viewConfiguration];
-    return;
-  }
-
-#if defined(CLAP_WRAPPER_HAS_CHARDIO_AUV3_METADATA)
-  if (policy == CHARDIO_AUV3_VIEW_POLICY_FIXED &&
-      (viewConfiguration.width != minimumWidth || viewConfiguration.height != minimumHeight))
-    return;
-  if (policy == CHARDIO_AUV3_VIEW_POLICY_RESIZABLE &&
-      (viewConfiguration.width < minimumWidth || viewConfiguration.height < minimumHeight))
-    return;
-#endif
-
-  const uint32_t width = static_cast<uint32_t>(viewConfiguration.width);
-  const uint32_t height = static_cast<uint32_t>(viewConfiguration.height);
-  if (width == 0 || height == 0) return;
-
-  _impl->_selectedViewWidth = width;
-  _impl->_selectedViewHeight = height;
-
-  if (_impl->_guiParentView)
-  {
-    __weak ClapAUv3AudioUnit *weakSelf = self;
-    void (^applySize)(void) = ^{
-      __strong ClapAUv3AudioUnit *audioUnit = weakSelf;
-      if (audioUnit && [audioUnit setGUISize:width height:height])
-        [audioUnit _applyGUISizeWidth:width height:height];
-    };
-    if ([NSThread isMainThread])
-      applySize();
-    else
-      dispatch_async(dispatch_get_main_queue(), applySize);
-  }
-}
-
 - (BOOL)_isInactiveForStateChange
 {
   if (!_impl) return NO;
@@ -1697,21 +1462,7 @@ static Clap::Library _library;
 
 - (NSArray<AUAudioUnitPreset *> *)factoryPresets
 {
-#if defined(CLAP_WRAPPER_HAS_CHARDIO_AUV3_METADATA)
-  if (!_impl) return @[];
-
-  NSMutableArray<AUAudioUnitPreset *> *result = [NSMutableArray new];
-  for (const auto &preset : _impl->_factoryPresets)
-  {
-    AUAudioUnitPreset *auPreset = [AUAudioUnitPreset new];
-    auPreset.number = preset.number;
-    auPreset.name = [NSString stringWithUTF8String:preset.name.c_str()];
-    if (auPreset.name) [result addObject:auPreset];
-  }
-  return result;
-#else
   return @[];
-#endif
 }
 
 - (AUAudioUnitPreset *)currentPreset
@@ -1725,21 +1476,7 @@ static Clap::Library _library;
 
   if (preset.number >= 0)
   {
-#if defined(CLAP_WRAPPER_HAS_CHARDIO_AUV3_METADATA)
-    if (!_impl || !_impl->_plugin) return;
-
-    const auto number = static_cast<int32_t>(preset.number);
-    const auto found = std::find_if(_impl->_factoryPresets.begin(), _impl->_factoryPresets.end(),
-                                    [number](const auto &candidate) { return candidate.number == number; });
-    if (found == _impl->_factoryPresets.end()) return;
-
-    auto mainGuard = _impl->_plugin->AlwaysMainThread();
-    if (!_impl->_chardioRuntimeMetadata.loadFactoryPreset(_impl->_plugin->_plugin, number)) return;
-    _impl->refreshParameterCache();
-    [self _notifyParameterValuesChanged];
-#else
     return;
-#endif
   }
   else
   {
@@ -2284,12 +2021,46 @@ static Clap::Library _library;
                   width:(uint32_t *)outWidth
                  height:(uint32_t *)outHeight
 {
-  if (!_impl || !_impl->_plugin || !_impl->_plugin->_ext._gui) return NO;
+  if (!_impl || !_impl->_plugin) return NO;
 
   // In out-of-process AUv3, _main_thread_id was captured on the XPC worker
   // thread during init, so the CLAP proxy doesn't recognize the actual main
   // thread. Override the thread identity for all GUI calls.
   auto mainGuard = _impl->_plugin->AlwaysMainThread();
+
+#if defined(CLAP_WRAPPER_HAS_CHOC_WEBVIEW)
+  if (_impl->_plugin->_ext._webview)
+  {
+    _impl->_webviewHost = std::make_unique<freeaudio::clap_wrapper::WebViewHost>(
+        _impl->_plugin->_plugin, _impl->_plugin->_ext._webview,
+        _impl->_plugin->_ext._webviewGui);
+
+    if (_impl->_webviewHost->isOpen())
+    {
+      const auto width = _impl->_webviewHost->width();
+      const auto height = _impl->_webviewHost->height();
+      [parentView setFrame:CGRectMake(0, 0, width, height)];
+
+      auto *view = (__bridge CLAPWRAP_ViewClass *)_impl->_webviewHost->viewHandle();
+      [view setFrame:[parentView bounds]];
+#if TARGET_OS_IPHONE
+      [view setAutoresizingMask:UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight];
+#else
+      [view setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+#endif
+      [parentView addSubview:view];
+
+      if (outWidth) *outWidth = width;
+      if (outHeight) *outHeight = height;
+      _impl->_guiParentView = parentView;
+      return YES;
+    }
+
+    _impl->_webviewHost.reset();
+  }
+#endif
+
+  if (!_impl->_plugin->_ext._gui) return NO;
 
   auto *gui = _impl->_plugin->_ext._gui;
   auto *plugin = _impl->_plugin->_plugin;
@@ -2363,9 +2134,20 @@ static Clap::Library _library;
 
 - (void)destroyGUI
 {
-  if (!_impl || !_impl->_plugin || !_impl->_plugin->_ext._gui) return;
+  if (!_impl || !_impl->_plugin) return;
 
   auto mainGuard = _impl->_plugin->AlwaysMainThread();
+#if defined(CLAP_WRAPPER_HAS_CHOC_WEBVIEW)
+  if (_impl->_webviewHost)
+  {
+    _impl->_webviewHost.reset();
+    _impl->_guiParentView = nil;
+    _impl->_viewController = nil;
+    return;
+  }
+#endif
+
+  if (!_impl->_plugin->_ext._gui) return;
   _impl->_plugin->_ext._gui->hide(_impl->_plugin->_plugin);
   _impl->_plugin->_ext._gui->destroy(_impl->_plugin->_plugin);
   _impl->_guiParentView = nil;
@@ -2374,14 +2156,28 @@ static Clap::Library _library;
 
 - (BOOL)canResizeGUI
 {
-  if (!_impl || !_impl->_plugin || !_impl->_plugin->_ext._gui) return NO;
+  if (!_impl || !_impl->_plugin) return NO;
+#if defined(CLAP_WRAPPER_HAS_CHOC_WEBVIEW)
+  if (_impl->_webviewHost) return _impl->_webviewHost->canResize() ? YES : NO;
+#endif
+  if (!_impl->_plugin->_ext._gui) return NO;
   auto mainGuard = _impl->_plugin->AlwaysMainThread();
   return _impl->_plugin->_ext._gui->can_resize(_impl->_plugin->_plugin) ? YES : NO;
 }
 
 - (BOOL)setGUISize:(uint32_t)width height:(uint32_t)height
 {
-  if (!_impl || !_impl->_plugin || !_impl->_plugin->_ext._gui) return NO;
+  if (!_impl || !_impl->_plugin) return NO;
+#if defined(CLAP_WRAPPER_HAS_CHOC_WEBVIEW)
+  if (_impl->_webviewHost)
+  {
+    if (!_impl->_webviewHost->setSize(width, height)) return NO;
+    auto *view = (__bridge CLAPWRAP_ViewClass *)_impl->_webviewHost->viewHandle();
+    [view setFrame:CGRectMake(0, 0, width, height)];
+    return YES;
+  }
+#endif
+  if (!_impl->_plugin->_ext._gui) return NO;
   auto mainGuard = _impl->_plugin->AlwaysMainThread();
   return _impl->_plugin->_ext._gui->set_size(_impl->_plugin->_plugin, width, height) ? YES : NO;
 }
@@ -2575,25 +2371,6 @@ static Clap::Library _library;
 
 - (void)_applyInitialViewConfiguration
 {
-  if (![NSThread isMainThread])
-  {
-    __weak ClapAUv3ViewController *weakSelf = self;
-    dispatch_async(dispatch_get_main_queue(), ^{
-      [weakSelf _applyInitialViewConfiguration];
-    });
-    return;
-  }
-
-#if defined(CLAP_WRAPPER_HAS_CHARDIO_AUV3_METADATA)
-  uint32_t policy = 0, width = 0, height = 0;
-  if (![self.audioUnit getViewPolicy:&policy minimumWidth:&width minimumHeight:&height] ||
-      policy == CHARDIO_AUV3_VIEW_POLICY_HOST_DEFAULT || width == 0 || height == 0)
-    return;
-
-  CGSize size = CGSizeMake(width, height);
-  self.view.frame = CGRectMake(0, 0, size.width, size.height);
-  self.preferredContentSize = size;
-#endif
 }
 
 - (void)loadView
