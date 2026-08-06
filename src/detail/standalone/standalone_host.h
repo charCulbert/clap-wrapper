@@ -1,13 +1,17 @@
 #pragma once
 
+#include <algorithm>
 #include <cstring>
 #include <functional>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <thread>
 #include <mutex>
 #include <optional>
+#include <string_view>
 #include <tuple>
+#include <vector>
 
 #include "standalone_details.h"
 
@@ -18,7 +22,10 @@
 #include "clap_proxy.h"
 #include "detail/shared/fixedqueue.h"
 #include "detail/shared/parameter_flush.h"
+#include "detail/standalone/standalone_midi_mapping.h"
 #include "detail/standalone/standalone_services_core.h"
+
+#include <clap/ext/param-indication.h>
 
 namespace freeaudio::clap_wrapper::standalone
 {
@@ -55,7 +62,10 @@ struct StandaloneHost : Clap::IHost, private choc::audio::io::AudioMIDICallback
   static bool oe_try_push(const struct clap_output_events *oe, const clap_event_header_t *evt)
   {
     auto *sh = static_cast<StandaloneHost *>(oe->ctx);
-    if (sh == nullptr || !sh->services.enqueueOutputEvent(evt)) return false;
+    if (sh == nullptr) return false;
+    const auto accepted = sh->services.enqueueOutputEvent(evt);
+    if (!accepted) return false;
+    sh->handlePluginOutputEvent(evt);
     if (sh->currentMidiOutput != nullptr &&
         evt->space_id == CLAP_CORE_EVENT_SPACE_ID &&
         evt->type == CLAP_EVENT_MIDI && evt->size == sizeof(clap_event_midi_t))
@@ -78,7 +88,9 @@ struct StandaloneHost : Clap::IHost, private choc::audio::io::AudioMIDICallback
     return sh->inputEvent(idx);
   }
 
-  static constexpr int maxEventsPerCycle{256};
+  // A mapped CC adds one parameter event beside the raw MIDI event.
+  static constexpr int maxMidiEventsPerCycle{1024};
+  static constexpr int maxEventsPerCycle{maxMidiEventsPerCycle * 2};
   static constexpr int eventSize{1024};
   static constexpr int queueSize{eventSize * maxEventsPerCycle};
   alignas(std::max_align_t) unsigned char eventQueue[queueSize]{};
@@ -136,10 +148,7 @@ struct StandaloneHost : Clap::IHost, private choc::audio::io::AudioMIDICallback
   {
     callbackRequested = true;
   }
-  void setupWrapperSpecifics(const clap_plugin_t *plugin) override
-  {
-    TRACE;
-  }
+  void setupWrapperSpecifics(const clap_plugin_t *plugin) override;
   const void *getExtension(const char *extension) override;
 
   bool saveStandaloneAndPluginSettings(const fs::path &intoDir, const fs::path &withName);
@@ -175,6 +184,8 @@ struct StandaloneHost : Clap::IHost, private choc::audio::io::AudioMIDICallback
   std::atomic_bool parameterFlushRequested{false};
   void serviceParameterFlushRequestOnMainThread();
   void serviceMainThreadRequests();
+  bool receiveWebviewMessage(const void *data, uint32_t size);
+  void syncMappingUI();
 
   bool gui_can_resize() override;
 
@@ -353,6 +364,56 @@ struct StandaloneHost : Clap::IHost, private choc::audio::io::AudioMIDICallback
 
   std::atomic<bool> running{true}, finishedRunning{false};
 
+  static constexpr uint32_t invalidMappingParamId = detail::StandaloneMidiMappingTable::invalidParamId;
+
+  struct MappingRecord
+  {
+    clap_id parameterId = invalidMappingParamId;
+    uint32_t cc = 0;
+    int32_t channel = -1;
+    double min = 0.0;
+    double max = 1.0;
+    uint32_t flags = 0;
+    std::string name;
+  };
+
+  struct ParameterTarget
+  {
+    clap_id id = invalidMappingParamId;
+    double min = 0.0;
+    double max = 1.0;
+    uint32_t flags = 0;
+    std::string name;
+  };
+
+  void handlePluginOutputEvent(const clap_event_header_t *event) noexcept;
+  void serviceMidiMapping();
+  bool handleMappingMessage(std::string_view message);
+  bool queryParameter(clap_id id, ParameterTarget& target) const;
+  void sendMappingMessage(std::string_view message) const;
+  void setMappingMode(bool enabled);
+  void clearMapping(clap_id parameterId);
+  void applyCapturedMapping();
+  void setParamMappingIndication(const MappingRecord& mapping, bool hasMapping);
+
+  const clap_plugin_param_indication_t *paramIndication{};
+  detail::StandaloneMidiMappingTable midiMappingTable;
+  std::vector<MappingRecord> mappingRecords;
+  std::atomic<bool> mappingMode{false};
+  std::atomic<clap_id> pendingGestureParamId{invalidMappingParamId};
+  std::atomic<uint64_t> pendingGestureSequence{0};
+  uint64_t servicedGestureSequence{};
+  std::atomic<clap_id> learningParamId{invalidMappingParamId};
+  std::atomic<uint64_t> learningMinBits{};
+  std::atomic<uint64_t> learningMaxBits{};
+  std::atomic<uint32_t> learningFlags{};
+  std::atomic<uint32_t> capturedMappingState{};
+  std::atomic<clap_id> capturedParamId{invalidMappingParamId};
+  std::atomic<uint32_t> capturedCC{};
+  std::atomic<uint32_t> capturedChannel{};
+  std::atomic<uint64_t> audioBlockSequence{};
+  bool mappingUIReady{};
+
   // We need to have play buffers for the clap. For now lets assume
   // (1) the standalone is never more than 64 total ins and outs and
   // (2) the block size is less that 4096 * 16 and
@@ -370,7 +431,7 @@ struct StandaloneHost : Clap::IHost, private choc::audio::io::AudioMIDICallback
 
   std::array<const float *, utilityBufferMaxChannels> deviceInputPointers{};
   std::array<float *, utilityBufferMaxChannels> deviceOutputPointers{};
-  std::array<DeviceMIDIEvent, maxEventsPerCycle> deviceMIDIEvents{};
+  std::array<DeviceMIDIEvent, maxMidiEventsPerCycle> deviceMIDIEvents{};
   uint32_t deviceInputChannels{};
   uint32_t deviceOutputChannels{};
   uint32_t deviceBlockFrames{};

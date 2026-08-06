@@ -144,8 +144,11 @@ std::unique_ptr<freeaudio::clap_wrapper::WebViewHost> webviewHost;
 
   if (plugin->_ext._webview)
   {
+    auto *standaloneHost = freeaudio::clap_wrapper::standalone::getStandaloneHost();
     webviewHost = std::make_unique<freeaudio::clap_wrapper::WebViewHost>(
-        plugin->_plugin, plugin->_ext._webview, plugin->_ext._webviewGui, plugin.get(), true);
+        plugin->_plugin, plugin->_ext._webview, plugin->_ext._webviewGui, plugin.get(), true,
+        [standaloneHost](const void *data, uint32_t size)
+        { return standaloneHost->receiveWebviewMessage(data, size); });
 
     if (webviewHost->isOpen())
     {
@@ -157,8 +160,9 @@ std::unique_ptr<freeaudio::clap_wrapper::WebViewHost> webviewHost;
       webviewHost->navigate();
       [[self window] setContentSize:NSMakeSize(webviewHost->width(), webviewHost->height())];
 
-      freeaudio::clap_wrapper::standalone::getStandaloneHost()->sendWebviewMessage =
+      standaloneHost->sendWebviewMessage =
           [](const void *buffer, uint32_t size) { return webviewHost->send(buffer, size); };
+      standaloneHost->syncMappingUI();
     }
     else
     {

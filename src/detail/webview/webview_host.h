@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -32,11 +33,13 @@ class WebViewHost
   }
 
 public:
+  using HostReceive = std::function<bool(const void *, uint32_t)>;
+
   WebViewHost(const clap_plugin_t *plugin, const clap_plugin_webview_t *webview,
               const clap_plugin_gui_t *sizingGui, Clap::Plugin *threadCheckedPlugin = nullptr,
-              bool deferInitialNavigation = false)
+              bool deferInitialNavigation = false, HostReceive hostReceive = {})
       : plugin(plugin), webview(webview), sizingGui(sizingGui),
-        threadCheckedPlugin(threadCheckedPlugin)
+        threadCheckedPlugin(threadCheckedPlugin), hostReceive(std::move(hostReceive))
   {
     if (!plugin || !webview || !webview->get_uri || !webview->get_resource || !webview->receive)
       return;
@@ -84,6 +87,9 @@ public:
         for (uint32_t i = 0; i < source.size(); ++i)
           bytes[i] = static_cast<uint8_t>(source[i].getWithDefault<int32_t>(0));
 
+        if (this->hostReceive && this->hostReceive(bytes.data(), static_cast<uint32_t>(bytes.size())))
+          return choc::value::Value(true);
+
         const auto accepted = this->withMainThread([&] {
           return this->webview->receive(this->plugin, bytes.data(),
                                         static_cast<uint32_t>(bytes.size()));
@@ -91,6 +97,7 @@ public:
         return choc::value::Value(accepted);
       });
       view.addInitScript(messageBridgeScript);
+      if (this->hostReceive) view.addInitScript(standaloneMappingScript);
       if (navigateWhenReady) view.navigate(navigationURI);
     };
 
@@ -174,6 +181,172 @@ private:
     event.stopImmediatePropagation();
     clapHostPostMessage(Array.from(bytes));
   }, { capture: true });
+})();
+)JS";
+
+  static constexpr const char *standaloneMappingScript = R"JS(
+(() => {
+  if (window.__clapWrapperStandaloneMapping)
+    return;
+  window.__clapWrapperStandaloneMapping = true;
+
+  const prefix = 'standalone-map:';
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  const mappings = new Map();
+  let mappingMode = false;
+  let target = null;
+
+  const panel = document.createElement('div');
+  panel.id = 'clap-wrapper-standalone-midi';
+  const shadow = panel.attachShadow({ mode: 'open' });
+  shadow.innerHTML = `
+    <style>
+      :host {
+        position: fixed;
+        top: 8px;
+        right: 8px;
+        z-index: 2147483647;
+        display: block;
+        color: #f4f4f4;
+        font: 12px -apple-system, BlinkMacSystemFont, sans-serif;
+        pointer-events: auto;
+      }
+      .panel {
+        min-width: 180px;
+        max-width: 280px;
+        padding: 8px;
+        border: 1px solid rgba(255, 255, 255, .28);
+        border-radius: 6px;
+        background: rgba(24, 24, 28, .92);
+        box-shadow: 0 3px 14px rgba(0, 0, 0, .35);
+      }
+      .toolbar, .row { display: flex; align-items: center; gap: 6px; }
+      .toolbar { justify-content: space-between; }
+      button {
+        color: inherit;
+        border: 1px solid rgba(255, 255, 255, .38);
+        border-radius: 4px;
+        background: rgba(255, 255, 255, .12);
+        padding: 4px 7px;
+        font: inherit;
+        cursor: pointer;
+      }
+      button:hover, button:focus-visible { background: rgba(255, 255, 255, .24); }
+      button[data-active] { border-color: #78b9ff; background: rgba(35, 120, 210, .45); }
+      .status { margin-top: 6px; color: #c8c8c8; line-height: 1.3; }
+      .rows { margin-top: 6px; }
+      .row { justify-content: space-between; padding-top: 4px; }
+      .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .empty { color: #979797; }
+      .clear { padding: 2px 5px; }
+    </style>
+    <div class="panel" role="region" aria-label="MIDI mapping">
+      <div class="toolbar">
+        <button class="map" type="button">Map MIDI</button>
+        <button class="clear-all" type="button" title="Clear all MIDI mappings">Clear all</button>
+      </div>
+      <div class="status" aria-live="polite">Ready</div>
+      <div class="rows"><span class="empty">No mappings</span></div>
+    </div>`;
+
+  const mapButton = shadow.querySelector('.map');
+  const clearAllButton = shadow.querySelector('.clear-all');
+  const status = shadow.querySelector('.status');
+  const rows = shadow.querySelector('.rows');
+
+  const post = command => window.parent.postMessage(
+    encoder.encode(`${prefix}${command}`).buffer, '*');
+  const decode = value => {
+    if (value instanceof ArrayBuffer)
+      return decoder.decode(new Uint8Array(value));
+    if (ArrayBuffer.isView(value))
+      return decoder.decode(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
+    return '';
+  };
+  const safeDecode = value => {
+    try { return decodeURIComponent(value); } catch (_) { return value; }
+  };
+
+  const render = () => {
+    rows.textContent = '';
+    if (!mappings.size) {
+      const empty = document.createElement('span');
+      empty.className = 'empty';
+      empty.textContent = 'No mappings';
+      rows.append(empty);
+      return;
+    }
+    for (const [id, mapping] of mappings) {
+      const row = document.createElement('div');
+      row.className = 'row';
+      const name = document.createElement('span');
+      name.className = 'name';
+      name.textContent = `${mapping.name || `Parameter ${id}`} — CC ${mapping.cc}`;
+      name.title = name.textContent;
+      const clear = document.createElement('button');
+      clear.className = 'clear';
+      clear.type = 'button';
+      clear.textContent = 'Clear';
+      clear.addEventListener('click', () => post(`clear:${id}`));
+      row.append(name, clear);
+      rows.append(row);
+    }
+  };
+
+  const setMode = enabled => {
+    mappingMode = enabled;
+    mapButton.toggleAttribute('data-active', enabled);
+    mapButton.textContent = enabled ? 'Cancel MIDI' : 'Map MIDI';
+    if (!enabled) target = null;
+  };
+
+  mapButton.addEventListener('click', () => post(mappingMode ? 'cancel' : 'begin'));
+  clearAllButton.addEventListener('click', () => post('clear-all'));
+  window.addEventListener('keydown', event => {
+    if (event.key === 'Escape' && mappingMode) {
+      event.preventDefault();
+      post('cancel');
+    }
+  }, true);
+  window.addEventListener('message', event => {
+    const text = decode(event.data);
+    if (!text.startsWith(prefix)) return;
+    const command = text.slice(prefix.length);
+    if (command === 'mode:1') {
+      setMode(true);
+      status.textContent = 'Touch a plug-in control, then move a MIDI CC';
+    } else if (command === 'mode:0') {
+      setMode(false);
+      status.textContent = 'Ready';
+    } else if (command.startsWith('target:')) {
+      const separator = command.indexOf(':', 7);
+      const name = separator < 0 ? '' : safeDecode(command.slice(separator + 1));
+      target = command.slice(7, separator < 0 ? command.length : separator);
+      status.textContent = `Move a MIDI CC for ${name || `parameter ${target}`}`;
+    } else if (command.startsWith('mapped:')) {
+      const parts = command.split(':');
+      if (parts.length >= 4) {
+        mappings.set(parts[1], { cc: parts[2], name: safeDecode(parts.slice(4).join(':')) });
+        target = null;
+        status.textContent = `Mapped to CC ${parts[2]}`;
+        render();
+      }
+    } else if (command.startsWith('unmapped:')) {
+      mappings.delete(command.slice(9));
+      render();
+    }
+  });
+
+  const mount = () => {
+    (document.body || document.documentElement).append(panel);
+    render();
+    post('ready');
+  };
+  if (document.body)
+    mount();
+  else
+    document.addEventListener('DOMContentLoaded', mount, { once: true });
 })();
 )JS";
 
@@ -262,6 +435,7 @@ private:
   const clap_plugin_webview_t *webview = nullptr;
   const clap_plugin_gui_t *sizingGui = nullptr;
   Clap::Plugin *threadCheckedPlugin = nullptr;
+  HostReceive hostReceive;
   std::unique_ptr<choc::ui::WebView> nativeView;
   uint32_t viewWidth = 800;
   uint32_t viewHeight = 500;

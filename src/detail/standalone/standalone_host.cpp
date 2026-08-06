@@ -1,6 +1,9 @@
 
 #include <cassert>
 #include <chrono>
+#include <cctype>
+#include <cmath>
+#include <cstdlib>
 #include "standalone_host.h"
 #include "standalone_settings.h"
 #include <fstream>
@@ -32,6 +35,41 @@ StandaloneHost *standaloneHostFor(const clap_host_t *host)
   if (host == nullptr || host->host_data == nullptr) return nullptr;
   auto *plugin = static_cast<Clap::Plugin *>(host->host_data);
   return static_cast<StandaloneHost *>(plugin->hostImplementation());
+}
+
+uint64_t doubleBits(double value)
+{
+  uint64_t bits{};
+  std::memcpy(&bits, &value, sizeof(bits));
+  return bits;
+}
+
+double bitsDouble(uint64_t bits)
+{
+  double value{};
+  std::memcpy(&value, &bits, sizeof(value));
+  return value;
+}
+
+std::string percentEncode(std::string_view value)
+{
+  static constexpr char hex[] = "0123456789ABCDEF";
+  std::string result;
+  result.reserve(value.size());
+  for (const auto byte : value)
+  {
+    const auto character = static_cast<unsigned char>(byte);
+    if (std::isalnum(character) || character == '-' || character == '_' ||
+        character == '.' || character == '~')
+      result.push_back(static_cast<char>(character));
+    else
+    {
+      result.push_back('%');
+      result.push_back(hex[character >> 4]);
+      result.push_back(hex[character & 0x0f]);
+    }
+  }
+  return result;
 }
 
 bool CLAP_ABI getAudioSnapshot(const clap_host_t *host, clap_wrapper_standalone_audio_snapshot_t *snapshot)
@@ -308,6 +346,213 @@ const void *StandaloneHost::getExtension(const char *extension)
   return nullptr;
 }
 
+void StandaloneHost::setupWrapperSpecifics(const clap_plugin_t *plugin)
+{
+  TRACE;
+  paramIndication = plugin != nullptr
+                        ? static_cast<const clap_plugin_param_indication_t *>(
+                              plugin->get_extension(plugin, CLAP_EXT_PARAM_INDICATION))
+                        : nullptr;
+  if (paramIndication == nullptr && plugin != nullptr)
+    paramIndication = static_cast<const clap_plugin_param_indication_t *>(
+        plugin->get_extension(plugin, CLAP_EXT_PARAM_INDICATION_COMPAT));
+}
+
+void StandaloneHost::handlePluginOutputEvent(const clap_event_header_t *event) noexcept
+{
+  if (event == nullptr || !mappingMode.load(std::memory_order_acquire) ||
+      event->space_id != CLAP_CORE_EVENT_SPACE_ID ||
+      event->type != CLAP_EVENT_PARAM_GESTURE_BEGIN ||
+      event->size < sizeof(clap_event_param_gesture_t))
+    return;
+
+  const auto &gesture = *reinterpret_cast<const clap_event_param_gesture_t *>(event);
+  pendingGestureParamId.store(gesture.param_id, std::memory_order_relaxed);
+  pendingGestureSequence.fetch_add(1, std::memory_order_release);
+}
+
+bool StandaloneHost::receiveWebviewMessage(const void *data, uint32_t size)
+{
+  if (data == nullptr || size == 0) return false;
+  return handleMappingMessage(std::string_view(static_cast<const char *>(data), size));
+}
+
+bool StandaloneHost::handleMappingMessage(std::string_view message)
+{
+  constexpr std::string_view prefix = "standalone-map:";
+  if (message.size() < prefix.size() || message.compare(0, prefix.size(), prefix) != 0)
+    return false;
+
+  const auto command = message.substr(prefix.size());
+  mappingUIReady = command == "ready" || mappingUIReady;
+  if (command == "ready")
+  {
+    syncMappingUI();
+    return true;
+  }
+  if (command == "begin")
+  {
+    setMappingMode(true);
+    return true;
+  }
+  if (command == "cancel")
+  {
+    setMappingMode(false);
+    return true;
+  }
+  if (command == "clear-all")
+  {
+    const auto mappings = mappingRecords;
+    for (const auto &mapping : mappings) clearMapping(mapping.parameterId);
+    return true;
+  }
+  constexpr std::string_view clearPrefix = "clear:";
+  if (command.size() >= clearPrefix.size() &&
+      command.compare(0, clearPrefix.size(), clearPrefix) == 0)
+  {
+    const auto idText = command.substr(clearPrefix.size());
+    char *end{};
+    const auto id = std::strtoul(std::string(idText).c_str(), &end, 10);
+    if (end != nullptr && *end == '\0' && id < invalidMappingParamId)
+      clearMapping(static_cast<clap_id>(id));
+    return true;
+  }
+  return true;
+}
+
+void StandaloneHost::syncMappingUI()
+{
+  if (!mappingUIReady) return;
+  sendMappingMessage(mappingMode.load(std::memory_order_acquire) ? "mode:1" : "mode:0");
+  for (const auto &mapping : mappingRecords)
+    sendMappingMessage("mapped:" + std::to_string(mapping.parameterId) + ":" +
+                       std::to_string(mapping.cc) + ":0:" + percentEncode(mapping.name));
+}
+
+void StandaloneHost::setMappingMode(bool enabled)
+{
+  mappingMode.store(enabled, std::memory_order_release);
+  pendingGestureParamId.store(invalidMappingParamId, std::memory_order_release);
+  learningParamId.store(invalidMappingParamId, std::memory_order_release);
+  if (!enabled && capturedMappingState.exchange(0, std::memory_order_acq_rel) != 0)
+    midiMappingTable.clearMapping(-1, capturedCC.load(std::memory_order_relaxed));
+  servicedGestureSequence = pendingGestureSequence.load(std::memory_order_acquire);
+  sendMappingMessage(enabled ? "mode:1" : "mode:0");
+}
+
+void StandaloneHost::sendMappingMessage(std::string_view message) const
+{
+  if (!mappingUIReady || !sendWebviewMessage) return;
+  const auto fullMessage = std::string{"standalone-map:"} + std::string(message);
+  sendWebviewMessage(fullMessage.data(), static_cast<uint32_t>(fullMessage.size()));
+}
+
+bool StandaloneHost::queryParameter(clap_id id, ParameterTarget &target) const
+{
+  if (clapPlugin == nullptr || clapPlugin->_ext._params == nullptr) return false;
+  auto mainGuard = clapPlugin->AlwaysMainThread();
+  clap_param_info_t info{};
+  if (!clapPlugin->_ext._params->get_info(clapPlugin->_plugin, id, &info)) return false;
+  if ((info.flags & CLAP_PARAM_IS_AUTOMATABLE) == 0 ||
+      (info.flags & CLAP_PARAM_IS_READONLY) != 0)
+    return false;
+  target.id = id;
+  target.min = info.min_value;
+  target.max = info.max_value;
+  target.flags = info.flags;
+  const auto *terminator = static_cast<const char *>(std::memchr(info.name, '\0', sizeof(info.name)));
+  target.name.assign(info.name,
+                     terminator != nullptr ? static_cast<std::size_t>(terminator - info.name)
+                                           : sizeof(info.name));
+  return true;
+}
+
+void StandaloneHost::setParamMappingIndication(const MappingRecord &mapping, bool hasMapping)
+{
+  if (paramIndication == nullptr || clapPlugin == nullptr) return;
+  auto mainGuard = clapPlugin->AlwaysMainThread();
+  const auto label = hasMapping
+                         ? std::string{"CC "} + std::to_string(mapping.cc)
+                         : std::string{};
+  const auto description = hasMapping ? std::string{"Mapped to "} + label : std::string{};
+  paramIndication->set_mapping(clapPlugin->_plugin, mapping.parameterId, hasMapping, nullptr,
+                               hasMapping ? label.c_str() : nullptr,
+                               hasMapping ? description.c_str() : nullptr);
+}
+
+void StandaloneHost::clearMapping(clap_id parameterId)
+{
+  const auto found = std::find_if(mappingRecords.begin(), mappingRecords.end(),
+                                  [parameterId](const auto &mapping)
+                                  { return mapping.parameterId == parameterId; });
+  if (found == mappingRecords.end()) return;
+  midiMappingTable.clearMapping(found->channel, found->cc);
+  setParamMappingIndication(*found, false);
+  sendMappingMessage("unmapped:" + std::to_string(found->parameterId));
+  mappingRecords.erase(found);
+}
+
+void StandaloneHost::applyCapturedMapping()
+{
+  if (capturedMappingState.exchange(0, std::memory_order_acq_rel) == 0) return;
+
+  const auto parameterId = capturedParamId.load(std::memory_order_relaxed);
+  const auto cc = capturedCC.load(std::memory_order_relaxed);
+  const auto channel = capturedChannel.load(std::memory_order_relaxed) == 0
+                           ? -1
+                           : static_cast<int32_t>(capturedChannel.load(std::memory_order_relaxed) - 1);
+  ParameterTarget target;
+  if (parameterId == invalidMappingParamId || cc >= detail::StandaloneMidiMappingTable::ccCount ||
+      !queryParameter(parameterId, target))
+  {
+    midiMappingTable.clearMapping(channel, cc);
+    return;
+  }
+
+  for (auto it = mappingRecords.begin(); it != mappingRecords.end();)
+  {
+    if (it->parameterId == parameterId || (it->cc == cc && it->channel == channel))
+    {
+      midiMappingTable.clearMapping(it->channel, it->cc);
+      setParamMappingIndication(*it, false);
+      sendMappingMessage("unmapped:" + std::to_string(it->parameterId));
+      it = mappingRecords.erase(it);
+    }
+    else
+      ++it;
+  }
+
+  const auto effectiveBlock = audioBlockSequence.load(std::memory_order_acquire) + 1;
+  midiMappingTable.setMapping(channel, cc, parameterId, target.min, target.max,
+                              target.flags, effectiveBlock);
+  MappingRecord mapping{parameterId, cc, channel, target.min, target.max, target.flags, target.name};
+  mappingRecords.push_back(mapping);
+  setParamMappingIndication(mapping, true);
+  sendMappingMessage("mapped:" + std::to_string(parameterId) + ":" +
+                    std::to_string(cc) + ":0:" + percentEncode(target.name));
+}
+
+void StandaloneHost::serviceMidiMapping()
+{
+  const auto mode = mappingMode.load(std::memory_order_acquire);
+  const auto gestureSequence = pendingGestureSequence.load(std::memory_order_acquire);
+  if (mode && gestureSequence != servicedGestureSequence)
+  {
+    servicedGestureSequence = gestureSequence;
+    const auto parameterId = pendingGestureParamId.load(std::memory_order_acquire);
+    ParameterTarget target;
+    if (parameterId != invalidMappingParamId && queryParameter(parameterId, target))
+    {
+      learningMinBits.store(doubleBits(target.min), std::memory_order_relaxed);
+      learningMaxBits.store(doubleBits(target.max), std::memory_order_relaxed);
+      learningFlags.store(target.flags, std::memory_order_relaxed);
+      learningParamId.store(parameterId, std::memory_order_release);
+      sendMappingMessage("target:" + std::to_string(parameterId) + ":" + percentEncode(target.name));
+    }
+  }
+  applyCapturedMapping();
+}
+
 void StandaloneHost::setupAudioBusses(const clap_plugin_t *plugin,
                                       const clap_plugin_audio_ports_t *audioports)
 {
@@ -376,6 +621,7 @@ void StandaloneHost::clapProcess(
                 currentSampleRate.load(std::memory_order_relaxed))
           : 0,
       static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now).count()));
+  const auto blockSequence = audioBlockSequence.fetch_add(1, std::memory_order_acq_rel) + 1;
 
   if (!running.load(std::memory_order_acquire) || !isActive.load(std::memory_order_acquire))
   {
@@ -480,17 +726,65 @@ void StandaloneHost::clapProcess(
 
   for (uint32_t i = 0; i < midiCount; ++i)
   {
+    const auto midiSize = static_cast<uint32_t>(
+        std::min<std::size_t>(midi[i].size, sizeof(midi[i].data)));
+    if (midiSize == 0) continue;
+
     clap_event_midi_t event{};
     event.header.size = sizeof(event);
     event.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
     event.header.type = CLAP_EVENT_MIDI;
     event.header.time = midi[i].frame;
     event.port_index = 0;
-    std::memcpy(event.data, midi[i].data, midi[i].size);
+    std::memcpy(event.data, midi[i].data, midiSize);
     if (!pushInputEvent(&event.header))
     {
       services.rejectEvent();
       break;
+    }
+
+    const auto learningParam = learningParamId.load(std::memory_order_acquire);
+    if (learningParam != invalidMappingParamId && midiSize == 3 &&
+        (midi[i].data[0] & 0xf0u) == 0xb0u)
+    {
+      const auto cc = static_cast<uint32_t>(midi[i].data[1]);
+      if (cc < detail::StandaloneMidiMappingTable::ccCount)
+      {
+        const auto min = bitsDouble(learningMinBits.load(std::memory_order_relaxed));
+        const auto max = bitsDouble(learningMaxBits.load(std::memory_order_relaxed));
+        const auto flags = learningFlags.load(std::memory_order_relaxed);
+        if (midiMappingTable.setMapping(-1, cc, learningParam, min, max, flags,
+                                         blockSequence + 1))
+        {
+          capturedParamId.store(learningParam, std::memory_order_relaxed);
+          capturedCC.store(cc, std::memory_order_relaxed);
+          capturedChannel.store(0, std::memory_order_relaxed);
+          capturedMappingState.store(1, std::memory_order_release);
+          learningParamId.store(invalidMappingParamId, std::memory_order_release);
+        }
+      }
+    }
+
+    detail::StandaloneMidiMappingTable::Value mapped;
+    if (midiMappingTable.valueFor(midi[i].data, midiSize, blockSequence, mapped))
+    {
+      clap_event_param_value_t parameter{};
+      parameter.header.size = sizeof(parameter);
+      parameter.header.time = midi[i].frame;
+      parameter.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+      parameter.header.type = CLAP_EVENT_PARAM_VALUE;
+      parameter.header.flags = CLAP_EVENT_IS_LIVE;
+      parameter.param_id = mapped.paramId;
+      parameter.note_id = -1;
+      parameter.port_index = -1;
+      parameter.channel = -1;
+      parameter.key = -1;
+      parameter.value = mapped.value;
+      if (!pushInputEvent(&parameter.header))
+      {
+        services.rejectEvent();
+        break;
+      }
     }
   }
 
@@ -543,6 +837,7 @@ void StandaloneHost::serviceParameterFlushRequestOnMainThread()
 void StandaloneHost::serviceMainThreadRequests()
 {
   serviceParameterFlushRequestOnMainThread();
+  serviceMidiMapping();
 
   if (callbackRequested.exchange(false) && clapPlugin)
   {

@@ -24,6 +24,15 @@ target_compile_features(standalone-services-tests PRIVATE cxx_std_17)
 target_link_libraries(standalone-services-tests PRIVATE Threads::Threads)
 add_test(NAME standalone-services COMMAND standalone-services-tests)
 
+add_executable(standalone-midi-mapping-tests standalone-midi-mapping-tests.cpp)
+target_include_directories(standalone-midi-mapping-tests PRIVATE
+    ../src
+    ${CLAP_SDK_ROOT}/include
+)
+target_compile_features(standalone-midi-mapping-tests PRIVATE cxx_std_17)
+target_link_libraries(standalone-midi-mapping-tests PRIVATE Threads::Threads)
+add_test(NAME standalone-midi-mapping COMMAND standalone-midi-mapping-tests)
+
 if (TARGET base-sdk-vst3)
     add_executable(vst3-process-timing-tests
         vst3-process-timing-tests.cpp
