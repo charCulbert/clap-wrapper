@@ -393,7 +393,7 @@ struct StandaloneHost : Clap::IHost, private choc::audio::io::AudioMIDICallback
   void sendMappingMessage(std::string_view message) const;
   void setMappingMode(bool enabled);
   void clearMapping(clap_id parameterId);
-  void applyCapturedMapping();
+  bool applyCapturedMapping();
   void setParamMappingIndication(const MappingRecord& mapping, bool hasMapping);
 
   const clap_plugin_param_indication_t *paramIndication{};

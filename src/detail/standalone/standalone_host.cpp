@@ -374,7 +374,43 @@ void StandaloneHost::handlePluginOutputEvent(const clap_event_header_t *event) n
 bool StandaloneHost::receiveWebviewMessage(const void *data, uint32_t size)
 {
   if (data == nullptr || size == 0) return false;
-  return handleMappingMessage(std::string_view(static_cast<const char *>(data), size));
+  const std::string_view message(static_cast<const char *>(data), size);
+  constexpr std::string_view notePrefix = "standalone-note:";
+  if (message.size() >= notePrefix.size() &&
+      message.compare(0, notePrefix.size(), notePrefix) == 0)
+  {
+    if (!hasMIDIInput) return true;
+
+    const auto command = message.substr(notePrefix.size());
+    constexpr std::string_view onPrefix = "on:";
+    constexpr std::string_view offPrefix = "off:";
+    const auto isOn = command.size() >= onPrefix.size() &&
+                      command.compare(0, onPrefix.size(), onPrefix) == 0;
+    const auto isOff = command.size() >= offPrefix.size() &&
+                       command.compare(0, offPrefix.size(), offPrefix) == 0;
+    if (!isOn && !isOff) return true;
+
+    const auto noteText = command.substr(isOn ? onPrefix.size() : offPrefix.size());
+    const auto noteString = std::string(noteText);
+    char *end{};
+    const auto note = std::strtoul(noteString.c_str(), &end, 10);
+    if (end == nullptr || *end != '\0' || note > 127) return true;
+
+    clap_event_midi_t event{};
+    event.header.size = sizeof(event);
+    event.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+    event.header.type = CLAP_EVENT_MIDI;
+    event.header.time = 0;
+    event.port_index = 0;
+    event.data[0] = static_cast<uint8_t>((isOn ? 0x90u : 0x80u) | 0u);
+    event.data[1] = static_cast<uint8_t>(note);
+    event.data[2] = isOn ? 100u : 0u;
+    const auto now = std::chrono::steady_clock::now().time_since_epoch();
+    const auto timestamp = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
+    return services.enqueueTimestampedEvent(&event.header, sizeof(event), timestamp);
+  }
+  return handleMappingMessage(message);
 }
 
 bool StandaloneHost::handleMappingMessage(std::string_view message)
@@ -411,8 +447,9 @@ bool StandaloneHost::handleMappingMessage(std::string_view message)
       command.compare(0, clearPrefix.size(), clearPrefix) == 0)
   {
     const auto idText = command.substr(clearPrefix.size());
+    const auto idString = std::string(idText);
     char *end{};
-    const auto id = std::strtoul(std::string(idText).c_str(), &end, 10);
+    const auto id = std::strtoul(idString.c_str(), &end, 10);
     if (end != nullptr && *end == '\0' && id < invalidMappingParamId)
       clearMapping(static_cast<clap_id>(id));
     return true;
@@ -423,6 +460,7 @@ bool StandaloneHost::handleMappingMessage(std::string_view message)
 void StandaloneHost::syncMappingUI()
 {
   if (!mappingUIReady) return;
+  sendMappingMessage(hasMIDIInput ? "keyboard:1" : "keyboard:0");
   sendMappingMessage(mappingMode.load(std::memory_order_acquire) ? "mode:1" : "mode:0");
   for (const auto &mapping : mappingRecords)
     sendMappingMessage("mapped:" + std::to_string(mapping.parameterId) + ":" +
@@ -492,9 +530,9 @@ void StandaloneHost::clearMapping(clap_id parameterId)
   mappingRecords.erase(found);
 }
 
-void StandaloneHost::applyCapturedMapping()
+bool StandaloneHost::applyCapturedMapping()
 {
-  if (capturedMappingState.exchange(0, std::memory_order_acq_rel) == 0) return;
+  if (capturedMappingState.exchange(0, std::memory_order_acq_rel) == 0) return false;
 
   const auto parameterId = capturedParamId.load(std::memory_order_relaxed);
   const auto cc = capturedCC.load(std::memory_order_relaxed);
@@ -506,7 +544,7 @@ void StandaloneHost::applyCapturedMapping()
       !queryParameter(parameterId, target))
   {
     midiMappingTable.clearMapping(channel, cc);
-    return;
+    return false;
   }
 
   for (auto it = mappingRecords.begin(); it != mappingRecords.end();)
@@ -530,6 +568,7 @@ void StandaloneHost::applyCapturedMapping()
   setParamMappingIndication(mapping, true);
   sendMappingMessage("mapped:" + std::to_string(parameterId) + ":" +
                     std::to_string(cc) + ":0:" + percentEncode(target.name));
+  return true;
 }
 
 void StandaloneHost::serviceMidiMapping()
@@ -550,7 +589,20 @@ void StandaloneHost::serviceMidiMapping()
       sendMappingMessage("target:" + std::to_string(parameterId) + ":" + percentEncode(target.name));
     }
   }
-  applyCapturedMapping();
+  if (applyCapturedMapping() && mode)
+  {
+    const auto parameterId = capturedParamId.load(std::memory_order_relaxed);
+    ParameterTarget target;
+    if (parameterId != invalidMappingParamId && queryParameter(parameterId, target))
+    {
+      learningMinBits.store(doubleBits(target.min), std::memory_order_relaxed);
+      learningMaxBits.store(doubleBits(target.max), std::memory_order_relaxed);
+      learningFlags.store(target.flags, std::memory_order_relaxed);
+      learningParamId.store(parameterId, std::memory_order_release);
+      sendMappingMessage("target:" + std::to_string(parameterId) + ":" +
+                         percentEncode(target.name));
+    }
+  }
 }
 
 void StandaloneHost::setupAudioBusses(const clap_plugin_t *plugin,
