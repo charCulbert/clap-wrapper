@@ -21,6 +21,7 @@
 
 #import <AudioToolbox/AudioToolbox.h>
 #import <AVFoundation/AVFoundation.h>
+#import <CoreMIDI/CoreMIDI.h>
 #include <atomic>
 #include <vector>
 #include <map>
@@ -29,6 +30,7 @@
 #include "../clap/automation.h"
 #include "../shared/fixedqueue.h"
 #include "../shared/parameter_flush.h"
+#include "../shared/midi_translation.h"
 
 namespace Clap::AUv3
 {
@@ -51,6 +53,7 @@ typedef union clap_multi_event
   clap_event_midi_t midi;
   clap_event_midi2_t midi2;
   clap_event_midi_sysex_t sysex;
+  clap_event_midi2_t midi2;
   clap_event_param_value_t param;
   clap_event_note_expression_t noteexpression;
   uint8_t custom[64];
@@ -106,13 +109,14 @@ class ProcessAdapter
                        uint32_t numOutputBusses, const uint32_t *outputChannelCounts,
                        const clap_plugin_t *plugin, const clap_plugin_params_t *ext_params,
                        Clap::IAutomation *automation, uint32_t numMaxSamples,
-                       uint32_t preferredMIDIDialect);
+                       uint32_t preferredMIDIDialect, uint32_t supportedMIDIDialects);
 
   void setupProcessing(uint32_t numInputBusses, const uint32_t *inputChannelCounts,
                        uint32_t numOutputBusses, const uint32_t *outputChannelCounts,
                        const clap_plugin_t *plugin, const clap_plugin_params_t *ext_params,
                        Clap::IAutomation *automation, uint32_t numMaxSamples,
-                       uint32_t preferredMIDIDialect, const Capacities &capacities);
+                       uint32_t preferredMIDIDialect, uint32_t supportedMIDIDialects,
+                       const Capacities &capacities);
 
   // Main render call - invoked from the AUv3 internalRenderBlock.
   // Translates AUv3 events, pulls input, calls CLAP process, and writes output.
@@ -157,8 +161,20 @@ class ProcessAdapter
   VectorCapacities vectorCapacities() const;
   uint64_t outputCopyCount() const;
 
-  // MIDI output event block (set by the AU host)
+  // MIDI output event block (set by the AU host) — legacy 3-byte MIDI 1.0 path
   AUMIDIOutputEventBlock __nullable midiOutputEventBlock;
+
+  // Modern MIDI 2.0 / Universal MIDI Packet output block (macOS 12 / iOS 15+),
+  // preferred over midiOutputEventBlock when the host provides it. Captured at
+  // allocate time like midiOutputEventBlock.
+  API_AVAILABLE(macos(12.0), ios(15.0))
+  AUMIDIEventListBlock __nullable midiOutputEventListBlock;
+
+  // Protocol the host negotiated via the AU's hostMIDIProtocol property. The
+  // UMP output list is deliberately always built as protocol-1.0 — the
+  // framework up-converts it to this protocol; kept for future native
+  // MIDI 2.0 output.
+  MIDIProtocolID hostMIDIProtocol = kMIDIProtocol_1_0;
 
  private:
   static uint32_t input_events_size(const struct clap_input_events *list);
@@ -176,6 +192,11 @@ class ProcessAdapter
   bool appendParameterRamp(const AUParameterEvent &event, clap_id parameterId, void *cookie,
                            uint32_t sampleOffset, AVAudioFrameCount frameCount);
   void appendMIDI2Events(const AUMIDIEventList &event, uint32_t sampleOffset);
+
+  // Translate one MIDI 1.0 channel-voice message (3 bytes) into CLAP events using
+  // the canonical rich mapping. Shared by the legacy AURenderEventMIDI path and
+  // the MIDI 1.0 messages arriving inside a UMP AURenderEventMIDIEventList.
+  void translateMidi1Bytes(uint8_t status, uint8_t data1, uint8_t data2, uint32_t sampleOffset);
 
   // Post-sort pass that guards against the AU scheduler reordering
   // same-block NOTE_ON/NOTE_OFF pairs. See process.mm for the full
@@ -230,6 +251,20 @@ class ProcessAdapter
   std::atomic<uint64_t> _outputCopyCount{0};
 
   uint32_t _preferred_midi_dialect = CLAP_NOTE_DIALECT_CLAP;
+  bool _midi_understands_midi2 = false;
+
+  // reassembles UMP SysEx7 across multi-packet messages on input
+  ClapWrapper::detail::shared::SysEx7Reassembler _sysexReassembler;
+  // owns the payloads referenced by CLAP_EVENT_MIDI_SYSEX events assembled from
+  // UMP for one process() cycle (clap_event_midi_sysex_t only borrows a pointer);
+  // reset at the top of each cycle. Pooled, so steady-state cycles do not
+  // allocate on the render thread.
+  ClapWrapper::detail::shared::SysExBufferPool _sysexBuffers;
+  // owns the payloads of CLAP_EVENT_MIDI_SYSEX events the plugin pushed to the
+  // output queue: the plugin only guarantees the buffer during try_push, but
+  // _outevents is drained after process() returns; reset together with
+  // _outevents. Pooled like _sysexBuffers.
+  ClapWrapper::detail::shared::SysExBufferPool _sysexOutBuffers;
 
   // Active note tracking for note expression targeting
   struct ActiveNote
