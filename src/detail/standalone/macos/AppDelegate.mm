@@ -7,7 +7,6 @@
 #include <map>
 #include <vector>
 
-#include <clapwrapper/standalone-services.h>
 #include "detail/standalone/entry.h"
 #include "detail/standalone/standalone_details.h"
 #include "detail/standalone/standalone_host.h"
@@ -146,9 +145,7 @@ std::unique_ptr<freeaudio::clap_wrapper::WebViewHost> webviewHost;
   {
     auto *standaloneHost = freeaudio::clap_wrapper::standalone::getStandaloneHost();
     webviewHost = std::make_unique<freeaudio::clap_wrapper::WebViewHost>(
-        plugin->_plugin, plugin->_ext._webview, plugin->_ext._webviewGui, plugin.get(), true,
-        [standaloneHost](const void *data, uint32_t size)
-        { return standaloneHost->receiveWebviewMessage(data, size); });
+        plugin->_plugin, plugin->_ext._webview, plugin->_ext._webviewGui, plugin.get(), true);
 
     if (webviewHost->isOpen())
     {
@@ -162,7 +159,6 @@ std::unique_ptr<freeaudio::clap_wrapper::WebViewHost> webviewHost;
 
       standaloneHost->sendWebviewMessage =
           [](const void *buffer, uint32_t size) { return webviewHost->send(buffer, size); };
-      standaloneHost->syncMappingUI();
     }
     else
     {

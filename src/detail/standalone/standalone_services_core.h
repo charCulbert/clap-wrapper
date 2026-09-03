@@ -9,7 +9,7 @@
 #include <utility>
 #include <vector>
 
-#include <clapwrapper/standalone-services.h>
+#include "detail/standalone/standalone_services_types.h"
 
 namespace freeaudio::clap_wrapper::standalone::detail
 {

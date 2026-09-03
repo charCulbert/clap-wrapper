@@ -54,66 +54,6 @@ RampEvent ramp(uint32_t time, uint32_t duration, double target)
   return result;
 }
 
-bool testAbiAndNegotiation()
-{
-  static_assert(offsetof(clap_wrapper_host_standalone_services_t, enqueue_event) >
-                    offsetof(clap_wrapper_host_standalone_services_t, get_midi_snapshot),
-                "extension ABI must remain append-only");
-  static_assert(offsetof(clap_wrapper_host_standalone_services_t, dequeue_output_event) >
-                    offsetof(clap_wrapper_host_standalone_services_t, get_event_telemetry),
-                "output retrieval is appended to extension ABI");
-  clap_wrapper_host_standalone_services_t extension{};
-  extension.abi_version = CLAP_WRAPPER_STANDALONE_SERVICES_ABI_VERSION;
-  extension.struct_size = offsetof(clap_wrapper_host_standalone_services_t,
-                                   enqueue_timestamped_event);
-  const bool legacyV1IsGuarded =
-      !CLAP_WRAPPER_STANDALONE_SERVICES_HAS_MEMBER(&extension, enqueue_timestamped_event) &&
-      !CLAP_WRAPPER_STANDALONE_SERVICES_HAS_MEMBER(&extension, dequeue_output_event) &&
-      !CLAP_WRAPPER_STANDALONE_SERVICES_HAS_MEMBER(&extension, get_output_event_telemetry);
-  extension.struct_size = sizeof(extension);
-  const bool appendedV1IsVisible =
-      CLAP_WRAPPER_STANDALONE_SERVICES_HAS_MEMBER(&extension, enqueue_timestamped_event) &&
-      CLAP_WRAPPER_STANDALONE_SERVICES_HAS_MEMBER(&extension, dequeue_output_event) &&
-      CLAP_WRAPPER_STANDALONE_SERVICES_HAS_MEMBER(&extension, get_output_event_telemetry);
-  StandaloneServicesCore services;
-  services.setAudioDevices({audioDevice(10)}, {audioDevice(20)});
-  clap_wrapper_standalone_audio_snapshot_t truncated{};
-  truncated.struct_size = offsetof(clap_wrapper_standalone_audio_snapshot_t, selected);
-  const bool rejected = !services.getAudioSnapshot(truncated);
-
-  clap_wrapper_standalone_audio_settings_t truncatedSettings{};
-  truncatedSettings.struct_size = offsetof(clap_wrapper_standalone_audio_settings_t, flags);
-  const bool settingsRejected = !services.applyAudioSettings(truncatedSettings);
-
-  clap_wrapper_standalone_audio_snapshot_t negotiated{};
-  negotiated.struct_size = sizeof(negotiated);
-  const bool needsStorage = !services.getAudioSnapshot(negotiated) &&
-                            negotiated.input_device_count == 1 && negotiated.output_device_count == 1;
-  clap_wrapper_standalone_audio_device_t input{}, output{};
-  negotiated.input_devices = &input;
-  negotiated.input_device_capacity = 1;
-  negotiated.output_devices = &output;
-  negotiated.output_device_capacity = 1;
-  clap_wrapper_standalone_audio_settings_t followsDefault{};
-  followsDefault.struct_size = sizeof(followsDefault);
-  followsDefault.output_device_id = 20;
-  followsDefault.output_channels = 2;
-  followsDefault.flags = CLAP_WRAPPER_STANDALONE_AUDIO_OUTPUT_ENABLED |
-                         CLAP_WRAPPER_STANDALONE_AUDIO_FOLLOW_DEFAULT_OUTPUT;
-  const bool defaultModeAccepted = services.applyAudioSettings(followsDefault);
-  auto invalidDefaultMode = followsDefault;
-  invalidDefaultMode.flags = CLAP_WRAPPER_STANDALONE_AUDIO_FOLLOW_DEFAULT_OUTPUT;
-  const bool defaultModeRequiresOutput = !services.applyAudioSettings(invalidDefaultMode);
-  return expect(legacyV1IsGuarded && appendedV1IsVisible,
-                "appended v1 service pointers are guarded by struct_size") &&
-         expect(rejected, "truncated snapshot ABI is rejected") &&
-         expect(settingsRejected, "truncated audio settings ABI is rejected") &&
-         expect(needsStorage, "snapshot reports required storage without partial output") &&
-         expect(services.getAudioSnapshot(negotiated) && input.id == 10 && output.id == 20,
-                "snapshot succeeds after size negotiation") &&
-         expect(defaultModeAccepted && defaultModeRequiresOutput,
-                "system-default output mode requires a valid enabled output route");
-}
 
 bool testIngressOrderCapacityAndRamp()
 {
@@ -540,7 +480,7 @@ bool testMidiRollbackState()
 
 int main()
 {
-  return testAbiAndNegotiation() && testIngressOrderCapacityAndRamp() && testBoundedSortedDelivery() &&
+  return testIngressOrderCapacityAndRamp() && testBoundedSortedDelivery() &&
                  testTimestampedIngressAndOutput() && testDelayedPublicationAcrossBlockBoundary() &&
                  testConcurrentOutputQueue() && testEnvelopeAndRollback() &&
                  testConcurrentIngress() && testThreadAndLifecycleGating()

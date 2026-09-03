@@ -585,11 +585,6 @@ const void *Plugin::clapExtension(const clap_host *host, const char *extension)
     return plugin->_parentHost->supportsWebview() ? &HostExt::webview : nullptr;
   }
 
-  if (auto *plugin = static_cast<Plugin *>(host->host_data))
-  {
-    if (const auto *hostExtension = plugin->_parentHost->getExtension(extension)) return hostExtension;
-  }
-
 #if LIN
   if (!strcmp(extension, CLAP_EXT_POSIX_FD_SUPPORT)) return &HostExt::hostposixfd;
 #endif

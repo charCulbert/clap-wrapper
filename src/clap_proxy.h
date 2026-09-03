@@ -29,7 +29,6 @@
 #include "detail/clap/fsutil.h"
 #include <clap/ext/draft/gain-adjustment-metering.h>
 #include <clapwrapper/event-registry.h>
-#include <clapwrapper/standalone-services.h>
 
 namespace Clap
 {
@@ -79,7 +78,6 @@ class IHost
 
   virtual bool track_info_get(clap_track_info_t *info) = 0;
   virtual const char *host_get_name() = 0;
-  virtual const void *getExtension(const char *) { return nullptr; }
 
   // context menu
 
