@@ -99,6 +99,7 @@ if (APPLE)
     target_link_libraries(auv3-process-tests PRIVATE
         "-framework AudioToolbox"
         "-framework AVFoundation"
+        "-framework CoreMIDI"
         "-framework Foundation"
     )
     add_test(NAME auv3-process COMMAND auv3-process-tests)

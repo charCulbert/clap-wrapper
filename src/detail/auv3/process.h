@@ -53,7 +53,6 @@ typedef union clap_multi_event
   clap_event_midi_t midi;
   clap_event_midi2_t midi2;
   clap_event_midi_sysex_t sysex;
-  clap_event_midi2_t midi2;
   clap_event_param_value_t param;
   clap_event_note_expression_t noteexpression;
   uint8_t custom[64];

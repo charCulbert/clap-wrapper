@@ -345,7 +345,7 @@ bool testDirectAndInPlace()
   auto plugin = makePlugin(state);
   Clap::AUv3::ProcessAdapter adapter;
   adapter.setupProcessing(1, channels, 1, channels, &plugin, nullptr, nullptr, frames,
-                          CLAP_NOTE_DIALECT_CLAP);
+                          CLAP_NOTE_DIALECT_CLAP, CLAP_NOTE_DIALECT_CLAP);
 
   float left[frames] = {};
   float right[frames] = {};
@@ -398,7 +398,7 @@ bool testNullBufferFallback()
   auto plugin = makePlugin(state);
   Clap::AUv3::ProcessAdapter adapter;
   adapter.setupProcessing(0, nullptr, 1, channels, &plugin, nullptr, nullptr, frames,
-                          CLAP_NOTE_DIALECT_CLAP);
+                          CLAP_NOTE_DIALECT_CLAP, CLAP_NOTE_DIALECT_CLAP);
 
   auto output = makeBufferList(2);
   output->mBuffers[0] = {1, frames * sizeof(float), nullptr};
@@ -423,7 +423,7 @@ bool testProcessErrorSilencesOutput()
   auto plugin = makePlugin(state);
   Clap::AUv3::ProcessAdapter adapter;
   adapter.setupProcessing(0, nullptr, 1, channels, &plugin, nullptr, nullptr, frames,
-                          CLAP_NOTE_DIALECT_CLAP);
+                          CLAP_NOTE_DIALECT_CLAP, CLAP_NOTE_DIALECT_CLAP);
 
   float left[frames] = {};
   float right[frames] = {};
@@ -452,7 +452,7 @@ bool testSingleBusSameTimestampIsFresh()
   auto plugin = makePlugin(state);
   Clap::AUv3::ProcessAdapter adapter;
   adapter.setupProcessing(1, channels, 1, channels, &plugin, nullptr, nullptr, frames,
-                          CLAP_NOTE_DIALECT_CLAP);
+                          CLAP_NOTE_DIALECT_CLAP, CLAP_NOTE_DIALECT_CLAP);
 
   float firstInput[frames] = {1.0f};
   float secondInput[frames] = {2.0f};
@@ -502,7 +502,7 @@ bool testMultiBusCaching()
   auto plugin = makePlugin(state);
   Clap::AUv3::ProcessAdapter adapter;
   adapter.setupProcessing(0, nullptr, 2, channels, &plugin, nullptr, nullptr, frames,
-                          CLAP_NOTE_DIALECT_CLAP);
+                          CLAP_NOTE_DIALECT_CLAP, CLAP_NOTE_DIALECT_CLAP);
 
   float bus1Left[frames] = {};
   float bus1Right[frames] = {};
@@ -534,7 +534,7 @@ bool testInterleavedFallback()
   auto plugin = makePlugin(state);
   Clap::AUv3::ProcessAdapter adapter;
   adapter.setupProcessing(0, nullptr, 1, channels, &plugin, nullptr, nullptr, frames,
-                          CLAP_NOTE_DIALECT_CLAP);
+                          CLAP_NOTE_DIALECT_CLAP, CLAP_NOTE_DIALECT_CLAP);
 
   float samples[frames * 2] = {};
   auto output = makeBufferList(1);
@@ -564,7 +564,7 @@ bool testCapacityBoundaries()
   capacities.activeNotes = 1;
   capacities.reorderScratch = 1;
   adapter.setupProcessing(0, nullptr, 1, channels, &plugin, nullptr, nullptr, frames,
-                          CLAP_NOTE_DIALECT_CLAP, capacities);
+                          CLAP_NOTE_DIALECT_CLAP, CLAP_NOTE_DIALECT_CLAP, capacities);
 
   auto originalCapacities = adapter.vectorCapacities();
   auto events = makeNoteOns(3);
@@ -607,7 +607,7 @@ bool testEventIndexOverflow()
   capacities.inputEvents = 3;
   capacities.eventIndices = 2;
   adapter.setupProcessing(0, nullptr, 1, channels, &plugin, nullptr, nullptr, frames,
-                          CLAP_NOTE_DIALECT_CLAP, capacities);
+                          CLAP_NOTE_DIALECT_CLAP, CLAP_NOTE_DIALECT_CLAP, capacities);
 
   auto events = makeNoteOns(3);
   auto output = makeBufferList(1);
@@ -629,7 +629,7 @@ bool testAcrossBlockHeldNoteRetrigger()
   auto plugin = makePlugin(state);
   Clap::AUv3::ProcessAdapter adapter;
   adapter.setupProcessing(0, nullptr, 1, channels, &plugin, nullptr, nullptr, frames,
-                          CLAP_NOTE_DIALECT_CLAP);
+                          CLAP_NOTE_DIALECT_CLAP, CLAP_NOTE_DIALECT_CLAP);
   auto output = makeBufferList(1);
   float samples[frames] = {};
   output->mBuffers[0] = {1, sizeof(samples), samples};
@@ -672,7 +672,7 @@ bool testActiveNoteAdmissionIsAtomic()
   Clap::AUv3::ProcessAdapter::Capacities capacities;
   capacities.activeNotes = 1;
   adapter.setupProcessing(0, nullptr, 1, channels, &plugin, nullptr, nullptr, frames,
-                          CLAP_NOTE_DIALECT_CLAP, capacities);
+                          CLAP_NOTE_DIALECT_CLAP, CLAP_NOTE_DIALECT_CLAP, capacities);
   std::vector<AURenderEvent> events(3);
   for (size_t i = 0; i < events.size(); ++i)
   {
@@ -716,7 +716,7 @@ bool testOverlappingSameKeyNotesPairFIFO()
   auto plugin = makePlugin(state);
   Clap::AUv3::ProcessAdapter adapter;
   adapter.setupProcessing(0, nullptr, 1, channels, &plugin, nullptr, nullptr, frames,
-                          CLAP_NOTE_DIALECT_CLAP);
+                          CLAP_NOTE_DIALECT_CLAP, CLAP_NOTE_DIALECT_CLAP);
   std::vector<AURenderEvent> events(4);
   for (size_t i = 0; i < events.size(); ++i)
   {
@@ -756,7 +756,7 @@ bool testSameBlockPolyPressureBindsNoteId()
   auto plugin = makePlugin(state);
   Clap::AUv3::ProcessAdapter adapter;
   adapter.setupProcessing(0, nullptr, 1, channels, &plugin, nullptr, nullptr, frames,
-                          CLAP_NOTE_DIALECT_CLAP);
+                          CLAP_NOTE_DIALECT_CLAP, CLAP_NOTE_DIALECT_CLAP);
   std::vector<AURenderEvent> events(2);
   for (size_t i = 0; i < events.size(); ++i)
   {
@@ -815,7 +815,7 @@ bool testTranslatedParameterRamp()
   Clap::AUv3::ProcessAdapter adapter;
   int cookie = 7;
   adapter.setupProcessing(0, nullptr, 1, channels, &plugin, nullptr, nullptr, frames,
-                          CLAP_NOTE_DIALECT_CLAP);
+                          CLAP_NOTE_DIALECT_CLAP, CLAP_NOTE_DIALECT_CLAP);
   adapter._cookieCache.emplace(42, &cookie);
   auto event = makeParameterRamp(103, 42, 0.75f, 1024);
   auto output = makeBufferList(1);
@@ -856,9 +856,9 @@ bool testRampTranslatorReceivesPluginInstance()
   Clap::AUv3::ProcessAdapter firstAdapter;
   Clap::AUv3::ProcessAdapter secondAdapter;
   firstAdapter.setupProcessing(0, nullptr, 1, channels, &firstPlugin, nullptr, nullptr, frames,
-                               CLAP_NOTE_DIALECT_CLAP);
+                               CLAP_NOTE_DIALECT_CLAP, CLAP_NOTE_DIALECT_CLAP);
   secondAdapter.setupProcessing(0, nullptr, 1, channels, &secondPlugin, nullptr, nullptr, frames,
-                                CLAP_NOTE_DIALECT_CLAP);
+                                CLAP_NOTE_DIALECT_CLAP, CLAP_NOTE_DIALECT_CLAP);
   firstAdapter._cookieCache.emplace(42, nullptr);
   secondAdapter._cookieCache.emplace(42, nullptr);
   auto event = makeParameterRamp(0, 42, 0.25f, 16);
@@ -893,7 +893,7 @@ bool testParameterRampFallbackAndCapacity()
   auto fallbackPlugin = makePlugin(fallbackState);
   Clap::AUv3::ProcessAdapter fallbackAdapter;
   fallbackAdapter.setupProcessing(0, nullptr, 1, channels, &fallbackPlugin, nullptr, nullptr, frames,
-                                  CLAP_NOTE_DIALECT_CLAP);
+                                  CLAP_NOTE_DIALECT_CLAP, CLAP_NOTE_DIALECT_CLAP);
   fallbackAdapter._cookieCache.emplace(42, nullptr);
   auto time = timestamp(0, 7);
   fallbackAdapter.process(&flags, &time, frames, 0, output.get(), &event, nil);
@@ -908,7 +908,7 @@ bool testParameterRampFallbackAndCapacity()
   capacities.inputEvents = 0;
   capacities.eventIndices = 0;
   translatedAdapter.setupProcessing(0, nullptr, 1, channels, &translatedPlugin, nullptr, nullptr, frames,
-                                    CLAP_NOTE_DIALECT_CLAP, capacities);
+                                    CLAP_NOTE_DIALECT_CLAP, CLAP_NOTE_DIALECT_CLAP, capacities);
   translatedAdapter._cookieCache.emplace(42, nullptr);
   const auto capacitiesBefore = translatedAdapter.vectorCapacities();
   time = timestamp(1, 8);
@@ -939,7 +939,7 @@ bool testMalformedParameterRampTranslation()
   auto plugin = makePlugin(state);
   Clap::AUv3::ProcessAdapter adapter;
   adapter.setupProcessing(0, nullptr, 1, channels, &plugin, nullptr, nullptr, frames,
-                          CLAP_NOTE_DIALECT_CLAP);
+                          CLAP_NOTE_DIALECT_CLAP, CLAP_NOTE_DIALECT_CLAP);
   adapter._cookieCache.emplace(42, nullptr);
   auto event = makeParameterRamp(0, 42, 0.5f, 12);
   auto output = makeBufferList(1);
@@ -961,7 +961,7 @@ bool testMIDI2EventLists()
   auto plugin = makePlugin(state);
   Clap::AUv3::ProcessAdapter adapter;
   adapter.setupProcessing(0, nullptr, 1, channels, &plugin, nullptr, nullptr, frames,
-                          CLAP_NOTE_DIALECT_CLAP);
+                          CLAP_NOTE_DIALECT_CLAP, CLAP_NOTE_DIALECT_CLAP);
   auto storage = makeMIDI2Event(103, 9, {{0x20abcdef},
                                          {0x40901234, 0x56789abc},
                                          {0x50abcdef, 2, 3, 4},
@@ -1026,7 +1026,7 @@ bool testMalformedMIDI2EventList()
   auto plugin = makePlugin(state);
   Clap::AUv3::ProcessAdapter adapter;
   adapter.setupProcessing(0, nullptr, 1, channels, &plugin, nullptr, nullptr, frames,
-                          CLAP_NOTE_DIALECT_CLAP);
+                          CLAP_NOTE_DIALECT_CLAP, CLAP_NOTE_DIALECT_CLAP);
   auto output = makeBufferList(1);
   float samples[frames] = {};
   output->mBuffers[0] = {1, sizeof(samples), samples};
@@ -1063,7 +1063,7 @@ bool testPluginRequestedParameterFlush()
   std::atomic_bool requestFlush{true};
   Clap::AUv3::ProcessAdapter adapter;
   adapter.setupProcessing(0, nullptr, 1, channels, &plugin, &testParams, &automation, frames,
-                          CLAP_NOTE_DIALECT_CLAP);
+                          CLAP_NOTE_DIALECT_CLAP, CLAP_NOTE_DIALECT_CLAP);
   adapter.setParameterFlushRequestFlag(&requestFlush);
   auto output = makeBufferList(1);
   float samples[frames] = {};
@@ -1207,7 +1207,7 @@ bool testPluginRequestedFlushOutputCapacity()
   Clap::AUv3::ProcessAdapter::Capacities capacities;
   capacities.outputEvents = 2;
   adapter.setupProcessing(0, nullptr, 1, channels, &plugin, &testParams, &automation, frames,
-                          CLAP_NOTE_DIALECT_CLAP, capacities);
+                          CLAP_NOTE_DIALECT_CLAP, CLAP_NOTE_DIALECT_CLAP, capacities);
   adapter.setParameterFlushRequestFlag(&requestFlush);
   auto output = makeBufferList(1);
   float samples[frames] = {};
