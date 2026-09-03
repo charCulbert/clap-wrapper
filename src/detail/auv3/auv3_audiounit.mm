@@ -277,7 +277,6 @@ class AUv3ImplDetail : public Clap::IHost, public Clap::IAutomation, public os::
 
     auto plugin = _plugin;
     auto *flag = &_requestUICallback;
-    auto *processing = &_parameterFlushRequiresAudioThread;
     auto *self = this;
     dispatch_source_set_event_handler(_idleTimer, ^{
       // Drain the parameter automation queue (Touch/Value/Release → host).
@@ -299,13 +298,17 @@ class AUv3ImplDetail : public Clap::IHost, public Clap::IAutomation, public os::
         }
       }
 
-      // Do NOT call params.flush() or on_main_thread() while processing.
-      // The render thread services pending parameter flushes outside process().
-      // JUCE's on_main_thread() acquires locks that process() also needs —
-      // calling both concurrently (main thread vs render thread) deadlocks.
-      if (processing->load()) return;
-
+      // Parameter flushes are only serviced here while the plugin is inactive;
+      // ParameterFlushLifecycle hands them to the render thread otherwise.
       self->serviceParameterFlushRequestOnMainThread();
+
+      // on_main_thread() is serviced whether or not the plugin is processing:
+      // CLAP's main and audio threads are concurrent by contract, and
+      // request_callback() promises a prompt (~30 Hz) main-thread callback.
+      // Gating on "active" starved every plugin of main-thread callbacks for
+      // the whole time audio was live (upstream carried the same gate as a
+      // JUCE-deadlock workaround; a JUCE plugin that cannot survive a
+      // concurrent on_main_thread() would deadlock in every DAW).
 
       // Service request_callback
       if (flag->exchange(false))
