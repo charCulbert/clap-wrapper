@@ -30,6 +30,29 @@ static MIDIPortRef sMIDIInputPort = 0;
 
   // MIDI
   AUScheduleMIDIEventBlock _scheduleMIDIBlock;
+
+  // Direct appex path: a default-output unit that pulls the AU's render block.
+  // Without it nothing ever calls process(), so the plugin is silent and never
+  // asks for main-thread callbacks (no telemetry / scope).
+  AudioUnit _directOutputUnit;
+}
+
+static AURenderBlock sDirectRenderBlock = nil;
+
+static OSStatus directOutputRender(void *, AudioUnitRenderActionFlags *ioActionFlags,
+                                   const AudioTimeStamp *inTimeStamp, UInt32, UInt32 inNumberFrames,
+                                   AudioBufferList *ioData)
+{
+  AURenderBlock block = sDirectRenderBlock;
+  if (!block)
+  {
+    for (UInt32 i = 0; i < ioData->mNumberBuffers; ++i)
+      memset(ioData->mBuffers[i].mData, 0, ioData->mBuffers[i].mDataByteSize);
+    return noErr;
+  }
+  // No input pull block: effects see silence on this path (the AVAudioEngine
+  // path handles input); instruments and MIDI processors are unaffected.
+  return block(ioActionFlags, inTimeStamp, inNumberFrames, 0, ioData, nil);
 }
 
 // ---------------------------------------------------------------------------
@@ -84,6 +107,7 @@ static MIDIPortRef sMIDIInputPort = 0;
 
   if (_directAU)
   {
+    [self stopDirectOutput];
     [_directAU deallocateRenderResources];
     _directAU = nil;
   }
@@ -366,6 +390,65 @@ static MIDIPortRef sMIDIInputPort = 0;
   [self setupMIDI];
 }
 
+- (BOOL)startDirectOutputForAU:(AUAudioUnit *)au
+{
+  if (au.outputBusses.count == 0)
+  {
+    std::cout << "[auv3-standalone] AU has no output busses; not starting audio output" << std::endl;
+    return NO;
+  }
+  AudioStreamBasicDescription asbd = *au.outputBusses[0].format.streamDescription;
+
+  AudioComponentDescription desc = {kAudioUnitType_Output, kAudioUnitSubType_DefaultOutput,
+                                    kAudioUnitManufacturer_Apple, 0, 0};
+  AudioComponent component = AudioComponentFindNext(NULL, &desc);
+  if (!component || AudioComponentInstanceNew(component, &_directOutputUnit) != noErr ||
+      !_directOutputUnit)
+  {
+    std::cout << "[auv3-standalone] ERROR: could not create default output unit" << std::endl;
+    return NO;
+  }
+
+  OSStatus status = AudioUnitSetProperty(_directOutputUnit, kAudioUnitProperty_StreamFormat,
+                                         kAudioUnitScope_Input, 0, &asbd, sizeof(asbd));
+  UInt32 maxFrames = (UInt32)au.maximumFramesToRender;
+  if (status == noErr)
+    status = AudioUnitSetProperty(_directOutputUnit, kAudioUnitProperty_MaximumFramesPerSlice,
+                                  kAudioUnitScope_Global, 0, &maxFrames, sizeof(maxFrames));
+  AURenderCallbackStruct callback = {directOutputRender, NULL};
+  if (status == noErr)
+    status = AudioUnitSetProperty(_directOutputUnit, kAudioUnitProperty_SetRenderCallback,
+                                  kAudioUnitScope_Input, 0, &callback, sizeof(callback));
+  if (status == noErr)
+  {
+    sDirectRenderBlock = au.renderBlock;
+    status = AudioUnitInitialize(_directOutputUnit);
+  }
+  if (status == noErr) status = AudioOutputUnitStart(_directOutputUnit);
+
+  if (status != noErr)
+  {
+    std::cout << "[auv3-standalone] ERROR: default output unit failed, status " << (int)status
+              << std::endl;
+    [self stopDirectOutput];
+    return NO;
+  }
+  std::cout << "[auv3-standalone] Direct output running: " << (int)asbd.mSampleRate << " Hz, "
+            << (int)asbd.mChannelsPerFrame << " ch, max " << (int)maxFrames << " frames"
+            << std::endl;
+  return YES;
+}
+
+- (void)stopDirectOutput
+{
+  if (!_directOutputUnit) return;
+  AudioOutputUnitStop(_directOutputUnit);
+  AudioUnitUninitialize(_directOutputUnit);
+  AudioComponentInstanceDispose(_directOutputUnit);
+  _directOutputUnit = NULL;
+  sDirectRenderBlock = nil;
+}
+
 - (void)finishSetupWithAUAudioUnit:(AUAudioUnit *)au
 {
   // Direct appex loading path: we have an AUAudioUnit but no AVAudioUnit.
@@ -377,6 +460,9 @@ static MIDIPortRef sMIDIInputPort = 0;
   // Store the raw AU -- we need to keep it alive
   _directAU = au;
 
+  // Generous slice so a large device buffer never exceeds what the AU allocated
+  au.maximumFramesToRender = 4096;
+
   // Allocate render resources
   NSError *error = nil;
   if (![au allocateRenderResourcesAndReturnError:&error])
@@ -387,6 +473,7 @@ static MIDIPortRef sMIDIInputPort = 0;
   else
   {
     std::cout << "[auv3-standalone] Render resources allocated" << std::endl;
+    [self startDirectOutputForAU:au];
   }
 
   // Set up the GUI from the AUAudioUnit directly
@@ -620,6 +707,10 @@ static MIDIPortRef sMIDIInputPort = 0;
     // Do NOT set autoresizingMask — it fights with explicit frame changes
     // from the plugin (which sets self.view.frame to the GUI size).
     // Window sizing is managed explicitly via _resizeWindowToFitGUI.
+    // No autoresizing mask: with Auto Layout active in the window (WKWebView
+    // brings it in), a translated sizable mask pins the content size and the
+    // window stops resizing altogether. windowDidResize: re-frames the AU view
+    // explicitly instead, and the VC's viewDidLayout forwards that to the GUI.
     auView.autoresizingMask = 0;
     [contentView addSubview:auView];
 
@@ -819,6 +910,16 @@ static void midiInputCallback(const MIDIPacketList *pktlist, void *readProcRefCo
   vc.view.frame = NSMakeRect(0, 0, size.width, size.height);
   [vc.view setNeedsDisplay:YES];
   [[window contentView] setNeedsDisplay:YES];
+}
+
+- (void)windowDidResize:(NSNotification *)notification
+{
+  // Belt and braces for the autoresizing mask: keep the AU view filling the
+  // content view so a host-side resize always reaches the plugin GUI.
+  NSView *content = [[self window] contentView];
+  NSView *au = _auViewController.view;
+  if (au && au.superview == content && !NSEqualSizes(au.frame.size, content.bounds.size))
+    au.frame = content.bounds;
 }
 
 - (void)_pollPreferredContentSize:(NSViewController *)vc retries:(int)retries
