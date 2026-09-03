@@ -89,6 +89,8 @@ function(guarantee_clap)
                 "Expected '${CLAP_SDK_ROOT}/include/clap/clap.h'.")
     endif()
 
+    # Export the resolved root for consumers outside this function scope (tests/).
+    set(CLAP_SDK_ROOT "${CLAP_SDK_ROOT}" CACHE PATH "Resolved CLAP SDK root")
     message(STATUS "clap-wrapper: Configuring clap sdk from ${CLAP_SDK_ROOT}")
     add_subdirectory("${CLAP_SDK_ROOT}" base-sdk-clap EXCLUDE_FROM_ALL)
     if (NOT TARGET clap)
@@ -124,6 +126,8 @@ function(guarantee_vst3sdk)
     endif()
 
     cmake_path(CONVERT "${VST3_SDK_ROOT}" TO_CMAKE_PATH_LIST VST3_SDK_ROOT)
+    # Export the resolved root for consumers outside this function scope (tests/).
+    set(VST3_SDK_ROOT "${VST3_SDK_ROOT}" CACHE PATH "Resolved VST3 SDK root")
     if(NOT EXISTS "${VST3_SDK_ROOT}/public.sdk/source/main/pluginfactory.cpp")
         message(FATAL_ERROR "There is no VST3 SDK at ${VST3_SDK_ROOT}. Please set VST3_SDK_ROOT appropriately ")
     endif()

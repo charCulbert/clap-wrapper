@@ -56,21 +56,6 @@ static bool auv3NotePortsSupportMPE(const clap_plugin_t *plugin)
   return false;
 }
 
-bool Clap::AUv3::inputNotePortsSupportMIDI2(const clap_plugin_t *plugin,
-                                             const clap_plugin_note_ports_t *notePorts)
-{
-  if (!plugin || !notePorts || !notePorts->count || !notePorts->get) return false;
-  const auto count = notePorts->count(plugin, true);
-  for (uint32_t index = 0; index < count; ++index)
-  {
-    clap_note_port_info_t info{};
-    if (notePorts->get(plugin, index, true, &info) &&
-        (info.supported_dialects & CLAP_NOTE_DIALECT_MIDI2) != 0)
-      return true;
-  }
-  return false;
-}
-
 NSTimeInterval Clap::AUv3::tailTimeForSamples(uint32_t samples, double sampleRate) noexcept
 {
   if (samples >= static_cast<uint32_t>(std::numeric_limits<int32_t>::max()))
@@ -176,7 +161,6 @@ class AUv3ImplDetail : public Clap::IHost, public Clap::IAutomation, public os::
   uint32_t _midi_preferred_dialect = CLAP_NOTE_DIALECT_CLAP;
   uint32_t _midi_supported_dialects = 0;
   bool _midi_wants_midi_input = false;
-  bool _supportsMIDI2 = false;
   bool _supportsMPE = false;
   std::vector<NSString *> _midiOutputNames;
 
@@ -384,7 +368,6 @@ class AUv3ImplDetail : public Clap::IHost, public Clap::IAutomation, public os::
     auto numMIDIOut = noteports->count(plugin, false);
 
     _midi_wants_midi_input = (numMIDIIn > 0);
-    _supportsMIDI2 = false;
     if (numMIDIIn > 0)
     {
       for (decltype(numMIDIIn) i = 0; i < numMIDIIn; ++i)
@@ -398,7 +381,6 @@ class AUv3ImplDetail : public Clap::IHost, public Clap::IAutomation, public os::
         }
       }
     }
-    _supportsMIDI2 = Clap::AUv3::inputNotePortsSupportMIDI2(plugin, noteports);
 
     _midiOutputNames.clear();
     for (decltype(numMIDIOut) i = 0; i < numMIDIOut; ++i)

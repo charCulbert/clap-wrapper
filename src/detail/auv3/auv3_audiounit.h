@@ -33,8 +33,6 @@
 
 namespace Clap::AUv3
 {
-bool inputNotePortsSupportMIDI2(const clap_plugin_t *plugin,
-                                const clap_plugin_note_ports_t *notePorts);
 NSTimeInterval tailTimeForSamples(uint32_t samples, double sampleRate) noexcept;
 
 }  // namespace Clap::AUv3

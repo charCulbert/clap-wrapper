@@ -174,7 +174,7 @@ class MIDIOutput
   bool addNoteOn(uint8_t channel, uint8_t note, uint8_t velocity, uint32_t sampleOffset);
   bool addNoteOff(uint8_t channel, uint8_t note, uint8_t velocity, uint32_t sampleOffset);
   bool addMIDI3Byte(const uint8_t *threebytes, uint32_t sampleOffset);
-  bool addSysEx(const uint8_t *data, uint32_t size);
+  bool addSysEx(const uint8_t *data, uint32_t size, uint32_t sampleOffset);
 
   void clear();
   const clap_note_port_info _info;
@@ -187,7 +187,7 @@ class MIDIOutput
  private:
 #if AUSDK_MIDI2_AVAILABLE
   // wrap a MIDI 1.0 channel-voice message into one MT 0x2 UMP word
-  void appendUMP1(uint8_t status, uint8_t data1, uint8_t data2)
+  void appendUMP1(uint8_t status, uint8_t data1, uint8_t data2, uint32_t sampleOffset)
   {
     // _umpCurrent is null when running on macOS < 11 (the list is never
     // initialized there) and once the list is full (MIDIEventListAdd returns
@@ -196,11 +196,11 @@ class MIDIOutput
     if (__builtin_available(macOS 11.0, *))
     {
       uint32_t word = ClapWrapper::detail::shared::midi1ToUmpWord(status, data1, data2);
-      _umpCurrent = MIDIEventListAdd(_umpList, sizeof(_umpBuffer), _umpCurrent, 0, 1, &word);
+      _umpCurrent = MIDIEventListAdd(_umpList, sizeof(_umpBuffer), _umpCurrent, sampleOffset, 1, &word);
     }
   }
   // pack a SysEx payload (0xF0/0xF7 framing stripped) into MT 0x3 SysEx7 packets
-  void appendUMPSysEx(const uint8_t *data, uint32_t size);
+  void appendUMPSysEx(const uint8_t *data, uint32_t size, uint32_t sampleOffset);
 #endif
 
   MIDIPacket *_current = nullptr;
@@ -255,7 +255,7 @@ bool MIDIOutput::addNoteOn(uint8_t channel, uint8_t note, uint8_t velocity, uint
 
   _current = next;
 #if AUSDK_MIDI2_AVAILABLE
-  appendUMP1(ev[0], ev[1], ev[2]);
+  appendUMP1(ev[0], ev[1], ev[2], sampleOffset);
 #endif
   ++_numEvents;
   return true;
@@ -271,7 +271,7 @@ bool MIDIOutput::addNoteOff(uint8_t channel, uint8_t note, uint8_t velocity, uin
 
   _current = next;
 #if AUSDK_MIDI2_AVAILABLE
-  appendUMP1(ev[0], ev[1], ev[2]);
+  appendUMP1(ev[0], ev[1], ev[2], sampleOffset);
 #endif
   ++_numEvents;
   return true;
@@ -308,42 +308,44 @@ bool MIDIOutput::addMIDI3Byte(const uint8_t *threebytes, uint32_t sampleOffset)
 #if AUSDK_MIDI2_AVAILABLE
   // mirror into the UMP list only once the packet-list add succeeded, so the two
   // views of the same block never diverge
-  appendUMP1(threebytes[0], threebytes[1], umpData2);
+  appendUMP1(threebytes[0], threebytes[1], umpData2, sampleOffset);
 #endif
   ++_numEvents;
   return true;
 }
 
-bool MIDIOutput::addSysEx(const uint8_t *data, uint32_t size)
+bool MIDIOutput::addSysEx(const uint8_t *data, uint32_t size, uint32_t sampleOffset)
 {
   if (!_current || !data || size == 0) return false;
   // MIDIPacketListAdd splits the payload across packets as needed, but the
   // whole list is still bounded by our fixed _buffer; very long SysEx that does
   // not fit is dropped (returns nullptr). The CLAP buffer already contains the
   // full message including the 0xF0/0xF7 framing.
-  _current = MIDIPacketListAdd(_midiPacketList, sizeof(_buffer), _current, 0, size, (Byte *)data);
+  _current =
+      MIDIPacketListAdd(_midiPacketList, sizeof(_buffer), _current, sampleOffset, size, (Byte *)data);
   if (_current == nullptr) return false;
 #if AUSDK_MIDI2_AVAILABLE
-  appendUMPSysEx(data, size);
+  appendUMPSysEx(data, size, sampleOffset);
 #endif
   ++_numEvents;
   return true;
 }
 
 #if AUSDK_MIDI2_AVAILABLE
-void MIDIOutput::appendUMPSysEx(const uint8_t *data, uint32_t size)
+void MIDIOutput::appendUMPSysEx(const uint8_t *data, uint32_t size, uint32_t sampleOffset)
 {
   if (__builtin_available(macOS 11.0, *))
   {
     ClapWrapper::detail::shared::packSysEx7(
         data, size,
-        [this](uint32_t w0, uint32_t w1)
+        [this, sampleOffset](uint32_t w0, uint32_t w1)
         {
           // stop appending once the list is full or was never initialized
           // (macOS < 11): MIDIEventListAdd must not be called with a null curPacket
           if (!_umpCurrent) return;
           uint32_t words[2] = {w0, w1};
-          _umpCurrent = MIDIEventListAdd(_umpList, sizeof(_umpBuffer), _umpCurrent, 0, 2, words);
+          _umpCurrent =
+              MIDIEventListAdd(_umpList, sizeof(_umpBuffer), _umpCurrent, sampleOffset, 2, words);
         });
   }
 }

@@ -95,12 +95,40 @@ bool testTwoByteMIDIOutputTiming()
                     second->data[1] == 87,
                 "AUv2 channel pressure preserves timestamp and two-byte length");
 }
+
+#if AUSDK_MIDI2_AVAILABLE
+bool testUMPOutputTiming()
+{
+  // Hosts on macOS 12+ that install the MIDI 2.0 event-list callback consume the
+  // UMP mirror instead of the packet list, so it must carry the same offsets.
+  clap_note_port_info port{};
+  port.id = 42;
+  free_audio::auv2_wrapper::MIDIOutput output(3, port);
+
+  if (!expect(output.addNoteOn(1, 60, 100, 37), "CLAP note output is accepted")) return false;
+  const uint8_t sysex[] = {0xF0, 0x7E, 0x7F, 0x09, 0x01, 0xF7};
+  if (!expect(output.addSysEx(sysex, sizeof(sysex), 41), "CLAP sysex output is accepted"))
+    return false;
+
+  const auto *list = output.getMIDIEventList();
+  if (!expect(list != nullptr && list->numPackets == 2, "UMP list mirrors both events"))
+    return false;
+  const auto *first = &list->packet[0];
+  const auto *second = MIDIEventPacketNext(first);
+  return expect(first->timeStamp == 37 && first->wordCount == 1,
+                "AUv2 UMP note keeps CLAP sample offset") &&
+         expect(second->timeStamp == 41 && second->wordCount == 2,
+                "AUv2 UMP sysex keeps CLAP sample offset");
+}
+#endif
 }  // namespace
 
 int main()
 {
-  return testNoteOutputTiming() && testMIDIOutputTiming() && testNoteOffOutputTiming() &&
-                 testTwoByteMIDIOutputTiming()
-             ? 0
-             : 1;
+  bool ok = testNoteOutputTiming() && testMIDIOutputTiming() && testNoteOffOutputTiming() &&
+            testTwoByteMIDIOutputTiming();
+#if AUSDK_MIDI2_AVAILABLE
+  ok = ok && testUMPOutputTiming();
+#endif
+  return ok ? 0 : 1;
 }

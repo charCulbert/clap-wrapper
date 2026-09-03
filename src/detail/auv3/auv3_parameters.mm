@@ -12,6 +12,7 @@
 
 namespace Clap::AUv3
 {
+
 // Split a module path like "Filter/Cutoff" into ["Filter", "Cutoff"]
 static std::vector<std::string> splitModulePath(const char *module)
 {
@@ -76,6 +77,7 @@ ParameterTreeResult createParameterTree(const clap_plugin_t *plugin, const clap_
     };
 
   clap_id bypassParamId = CLAP_INVALID_ID;
+
   // Root group node for building hierarchy
   GroupNode root;
   root.name = "Root";

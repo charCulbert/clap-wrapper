@@ -1853,7 +1853,7 @@ void WrapAsAUV2::send(const Clap::AUv2::clap_multi_event_t &event)
       {
         if (i->_info.id == portid)
         {
-          i->addSysEx(sx.buffer, sx.size);
+          i->addSysEx(sx.buffer, sx.size, event.header.time);
           break;
         }
       }

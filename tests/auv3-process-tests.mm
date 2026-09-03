@@ -300,7 +300,8 @@ AURenderEvent makeParameterRamp(AUEventSampleTime sampleTime, AUParameterAddress
 }
 
 std::vector<uint8_t> makeMIDI2Event(AUEventSampleTime sampleTime, uint8_t cable,
-                                    const std::vector<std::vector<uint32_t>> &packets)
+                                    const std::vector<std::vector<uint32_t>> &packets,
+                                    MIDIProtocolID protocol = kMIDIProtocol_1_0)
 {
   size_t bytes = offsetof(AUMIDIEventList, eventList.packet);
   for (const auto &words : packets)
@@ -311,6 +312,7 @@ std::vector<uint8_t> makeMIDI2Event(AUEventSampleTime sampleTime, uint8_t cable,
   event->MIDIEventsList.eventSampleTime = sampleTime;
   event->MIDIEventsList.eventType = AURenderEventMIDIEventList;
   event->MIDIEventsList.cable = cable;
+  event->MIDIEventsList.eventList.protocol = protocol;
   event->MIDIEventsList.eventList.numPackets = static_cast<uint32_t>(packets.size());
   auto *packet = &event->MIDIEventsList.eventList.packet[0];
   for (const auto &words : packets)
@@ -955,67 +957,102 @@ bool testMalformedParameterRampTranslation()
 
 bool testMIDI2EventLists()
 {
+  // UMP event lists go through the dialect-aware translation: MIDI 1.0 channel
+  // voice (MT 0x2) becomes CLAP note events, MIDI 2.0 channel voice (MT 0x4) is
+  // forwarded raw only to a plugin that speaks the MIDI2 dialect, and every
+  // other message type is dropped.
   constexpr uint32_t frames = 8;
   uint32_t channels[] = {1};
-  TestState state;
-  auto plugin = makePlugin(state);
-  Clap::AUv3::ProcessAdapter adapter;
-  adapter.setupProcessing(0, nullptr, 1, channels, &plugin, nullptr, nullptr, frames,
-                          CLAP_NOTE_DIALECT_CLAP, CLAP_NOTE_DIALECT_CLAP);
-  auto storage = makeMIDI2Event(103, 9, {{0x20abcdef},
-                                         {0x40901234, 0x56789abc},
-                                         {0x50abcdef, 2, 3, 4},
-                                         {0x60abcdef},
-                                         {0x70abcdef},
-                                         {0x80abcdef, 2},
-                                         {0xA0abcdef, 2},
-                                         {0xB0abcdef, 2, 3},
-                                         {0xC0abcdef, 2, 3},
-                                         {0xD0abcdef, 2, 3, 4},
-                                         {0xF0abcdef, 2, 3, 4}});
-  auto output = makeBufferList(1);
-  float samples[frames] = {};
-  output->mBuffers[0] = {1, sizeof(samples), samples};
-  auto time = timestamp(100, 9);
-  AudioUnitRenderActionFlags flags = 0;
-  adapter.process(&flags, &time, frames, 0, output.get(),
-                  reinterpret_cast<const AURenderEvent *>(storage.data()), nil);
 
-  const auto &one = state.inputEvents[0];
-  const auto &two = state.inputEvents[1];
-  const auto &four = state.inputEvents[2];
-  return expect(state.inputEventCount == 11, "MIDI2 list splits all UMP word counts") &&
-         expect(one.header.time == 3 && one.midi2Port == 9 && one.midi2Data[0] == 0x20abcdef &&
-                    one.midi2Data[1] == 0 && one.midi2Data[2] == 0 && one.midi2Data[3] == 0,
-                "32-bit UMP keeps offset cable and zero fill") &&
-         expect(two.midi2Data[0] == 0x40901234 && two.midi2Data[1] == 0x56789abc &&
-                    two.midi2Data[2] == 0 && two.midi2Data[3] == 0,
-                "64-bit UMP keeps two words and zero fill") &&
-         expect(four.midi2Data[0] == 0x50abcdef && four.midi2Data[1] == 2 &&
-                    four.midi2Data[2] == 3 && four.midi2Data[3] == 4,
-                "128-bit UMP keeps all four words") &&
-         expect(state.inputEvents[3].midi2Data[0] == 0x60abcdef &&
-                    state.inputEvents[3].midi2Data[1] == 0 &&
-                    state.inputEvents[4].midi2Data[0] == 0x70abcdef &&
-                    state.inputEvents[4].midi2Data[1] == 0,
-                "types 6 and 7 are one-word UMPs") &&
-         expect(state.inputEvents[5].midi2Data[0] == 0x80abcdef &&
-                    state.inputEvents[5].midi2Data[1] == 2 &&
-                    state.inputEvents[6].midi2Data[0] == 0xA0abcdef &&
-                    state.inputEvents[6].midi2Data[1] == 2,
-                "types 8 and A are two-word UMPs") &&
-         expect(state.inputEvents[7].midi2Data[0] == 0xB0abcdef &&
-                    state.inputEvents[7].midi2Data[2] == 3 &&
-                    state.inputEvents[7].midi2Data[3] == 0 &&
-                    state.inputEvents[8].midi2Data[0] == 0xC0abcdef &&
-                    state.inputEvents[8].midi2Data[2] == 3 &&
-                    state.inputEvents[8].midi2Data[3] == 0,
-                "types B and C are three-word UMPs with zero fill") &&
-         expect(state.inputEvents[9].midi2Data[0] == 0xD0abcdef &&
-                    state.inputEvents[9].midi2Data[3] == 4 &&
-                    state.inputEvents[10].midi2Data[0] == 0xF0abcdef &&
-                    state.inputEvents[10].midi2Data[3] == 4,
-                "types D and F are four-word UMPs");
+  // 1. CLAP-dialect plugin, protocol 1.0 list: one MT 0x2 note-on is translated,
+  //    the utility / system / data / reserved words around it are dropped.
+  {
+    TestState state;
+    auto plugin = makePlugin(state);
+    Clap::AUv3::ProcessAdapter adapter;
+    adapter.setupProcessing(0, nullptr, 1, channels, &plugin, nullptr, nullptr, frames,
+                            CLAP_NOTE_DIALECT_CLAP, CLAP_NOTE_DIALECT_CLAP);
+    auto storage = makeMIDI2Event(103, 9,
+                                  {{0x00abcdef},
+                                   {0x10abcdef},
+                                   {0x20913c40},  // MT 0x2: note on ch 1 key 60 vel 64
+                                   {0x50abcdef, 2, 3, 4},
+                                   {0x60abcdef},
+                                   {0x70abcdef},
+                                   {0x80abcdef, 2},
+                                   {0xA0abcdef, 2},
+                                   {0xB0abcdef, 2, 3},
+                                   {0xC0abcdef, 2, 3},
+                                   {0xD0abcdef, 2, 3, 4},
+                                   {0xF0abcdef, 2, 3, 4}});
+    auto output = makeBufferList(1);
+    float samples[frames] = {};
+    output->mBuffers[0] = {1, sizeof(samples), samples};
+    auto time = timestamp(100, 9);
+    AudioUnitRenderActionFlags flags = 0;
+    adapter.process(&flags, &time, frames, 0, output.get(),
+                    reinterpret_cast<const AURenderEvent *>(storage.data()), nil);
+
+    const auto &note = state.inputEvents[0];
+    if (!expect(state.inputEventCount == 1, "only the MIDI 1.0 channel-voice UMP is translated") ||
+        !expect(note.header.type == CLAP_EVENT_NOTE_ON && note.header.time == 3 &&
+                    note.noteKey == 60 && note.noteChannel == 1,
+                "MT 0x2 note on becomes a CLAP note at the list offset") ||
+        !expect(adapter.overflowCounts().midi2Malformed == 0,
+                "well-formed UMP lists are not counted as malformed"))
+      return false;
+  }
+
+  // 2. MIDI2-dialect plugin, protocol 2.0 list: MT 0x4 is forwarded raw with the
+  //    cable as port index and unused words zero-filled.
+  {
+    TestState state;
+    auto plugin = makePlugin(state);
+    Clap::AUv3::ProcessAdapter adapter;
+    adapter.setupProcessing(0, nullptr, 1, channels, &plugin, nullptr, nullptr, frames,
+                            CLAP_NOTE_DIALECT_MIDI2, CLAP_NOTE_DIALECT_CLAP | CLAP_NOTE_DIALECT_MIDI2);
+    auto storage = makeMIDI2Event(103, 9, {{0x40901234, 0x56789abc}}, kMIDIProtocol_2_0);
+    auto output = makeBufferList(1);
+    float samples[frames] = {};
+    output->mBuffers[0] = {1, sizeof(samples), samples};
+    auto time = timestamp(100, 9);
+    AudioUnitRenderActionFlags flags = 0;
+    adapter.process(&flags, &time, frames, 0, output.get(),
+                    reinterpret_cast<const AURenderEvent *>(storage.data()), nil);
+
+    const auto &raw = state.inputEvents[0];
+    if (!expect(state.inputEventCount == 1 && raw.header.type == CLAP_EVENT_MIDI2,
+                "MIDI2-capable plugin receives MT 0x4 raw") ||
+        !expect(raw.header.time == 3 && raw.midi2Port == 9 && raw.midi2Data[0] == 0x40901234 &&
+                    raw.midi2Data[1] == 0x56789abc && raw.midi2Data[2] == 0 && raw.midi2Data[3] == 0,
+                "raw MIDI2 keeps offset, cable and zero fill"))
+      return false;
+  }
+
+  // 3. CLAP-dialect plugin, protocol 2.0 list: MT 0x4 is down-converted to MIDI 1.0
+  //    and then translated like any other note on.
+  {
+    TestState state;
+    auto plugin = makePlugin(state);
+    Clap::AUv3::ProcessAdapter adapter;
+    adapter.setupProcessing(0, nullptr, 1, channels, &plugin, nullptr, nullptr, frames,
+                            CLAP_NOTE_DIALECT_CLAP, CLAP_NOTE_DIALECT_CLAP);
+    // MT 0x4 note on, ch 1, key 60, 16-bit velocity 0x8000
+    auto storage = makeMIDI2Event(103, 9, {{0x40913c00, 0x80000000}}, kMIDIProtocol_2_0);
+    auto output = makeBufferList(1);
+    float samples[frames] = {};
+    output->mBuffers[0] = {1, sizeof(samples), samples};
+    auto time = timestamp(100, 9);
+    AudioUnitRenderActionFlags flags = 0;
+    adapter.process(&flags, &time, frames, 0, output.get(),
+                    reinterpret_cast<const AURenderEvent *>(storage.data()), nil);
+
+    const auto &note = state.inputEvents[0];
+    return expect(state.inputEventCount == 1 && note.header.type == CLAP_EVENT_NOTE_ON,
+                  "CLAP-only plugin receives down-converted MIDI2 as a CLAP note") &&
+           expect(note.header.time == 3 && note.noteKey == 60 && note.noteChannel == 1,
+                  "down-converted note keeps offset, key and channel");
+  }
 }
 
 bool testMalformedMIDI2EventList()
