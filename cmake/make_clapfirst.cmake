@@ -44,6 +44,10 @@ function(make_clapfirst_plugins)
             ASSET_OUTPUT_DIRECTORY
             RESOURCE_DIRECTORY # Entire directory to be copied into a bundle/folder's resources
 
+            WCLAP_MEMORY_MINIMUM # Optional memory.json hint packaged in the .wclap for browser hosts:
+            WCLAP_MEMORY_INITIAL # the heap the plugin cannot work below, the heap to reserve before the
+            WCLAP_MEMORY_MAXIMUM # first note, and its worst-case peak. Bytes or 64MiB style. All three or none.
+
             AUV3_BUILD_STANDALONE # TRUE (default) to add the macOS AUv3 host app, FALSE for the appex only
             AUV3_FACTORY_SOURCE  # product-owned ObjC++ or Swift AUAudioUnitFactory / AUViewController source
             AUV3_FACTORY_CLASS   # Objective-C name exported by AUV3_FACTORY_SOURCE; Swift uses @objc(name)
@@ -358,9 +362,16 @@ function(make_clapfirst_plugins)
         set(WCLAP_TARGET ${C1ST_TARGET_NAME}_wclap)
         add_executable(${WCLAP_TARGET} ${C1ST_ENTRY_SOURCE})
         target_link_libraries(${WCLAP_TARGET} PRIVATE ${C1ST_IMPL_TARGET})
+        set(_wclap_memory_arguments)
+        foreach (key IN ITEMS MINIMUM INITIAL MAXIMUM)
+            if (DEFINED C1ST_WCLAP_MEMORY_${key})
+                list(APPEND _wclap_memory_arguments MEMORY_${key} "${C1ST_WCLAP_MEMORY_${key}}")
+            endif()
+        endforeach()
         target_add_wclap_configuration(TARGET ${WCLAP_TARGET}
                 OUTPUT_NAME ${C1ST_OUTPUT_NAME}
                 RESOURCE_DIRECTORY "${C1ST_RESOURCE_DIRECTORY}"
+                ${_wclap_memory_arguments}
         )
         if (DEFINED C1ST_ASSET_OUTPUT_DIRECTORY)
             # set the RUNTIME path because module.wasm are built as binaries (dynamic libraries for WASM aren't well-defined)
