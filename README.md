@@ -65,6 +65,21 @@ add `AUV3` to `PLUGIN_FORMATS` instead. On iOS the hosted CLAP is
 statically linked into the appex (single-plugin); see the wiki for the
 current AUv3 feature status.
 
+## This fork (charCulbert/clap-wrapper)
+
+Upstream plus native-side additions, all opt-in through `make_clapfirst_plugins`
+(the argument comments in `cmake/make_clapfirst.cmake` are the reference):
+
+- `clap.webview/3` hosting in the macOS standalone and AUv3 (CHOC WKWebView,
+  `CLAP_WRAPPER_CHOC_ROOT`), and a CHOC/RtAudio standalone;
+- AUv3 hardening: bounded event capacities, `AUV3_BUILD_STANDALONE`,
+  product-owned `AUV3_FACTORY_SOURCE`/`AUV3_FACTORY_CLASS`, `auv3-param-ramp`;
+- sample-accurate AUv2 MIDI output, parameter-flush lifecycle;
+- `WCLAP_MEMORY_MINIMUM` / `WCLAP_MEMORY_INITIAL` / `WCLAP_MEMORY_MAXIMUM`
+  (bytes or `64MiB`): packages a `memory.json` hint next to `module.wasm` so a
+  browser host can reserve the plug-in's heap deliberately. Only the author
+  knows these numbers; give all three or none.
+
 ## Licensing
 
 The `clap-wrapper` project is released under the MIT license.
